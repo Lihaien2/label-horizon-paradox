@@ -1,7 +1,9 @@
-"""Trading calendar.
+"""交易日历（Tushare 实现）。
 
-Data source: DDB WINDDATA_MONTH.AShareCalendar (SSE exchange, A-share trading days).
-The single source of truth for the backtest timeline. Comes with local cache.
+数据源：Tushare ``trade_cal`` 接口（SSE 交易所，A股交易日）。
+回测时间轴的唯一事实来源，带本地 parquet 缓存。
+
+（【改动】原为 DolphinDB AShareCalendar，现改用 Tushare trade_cal。）
 """
 
 from __future__ import annotations
@@ -9,32 +11,28 @@ from __future__ import annotations
 import pandas as pd
 
 from data_fetch.cache import cache_key, read_cache, write_cache
-from data_fetch.connection import dc
+from data_fetch.connection import pro
 
 __all__ = ["trading_dates", "align_to_trading", "is_trading_day", "next_trading_day", "prev_trading_day"]
 
-# A-share calendar uses the SSE; SSE and SZSE trading days are identical
+# A股日历用上交所（SSE）；上交所与深交所交易日一致。
 _EXCH = "SSE"
 _CACHE_NAME = "calendar"
 
 
-def _fetch_all() -> pd.DataFrame:
-    """Pull all SSE trading days from DDB; returns a DatetimeIndex."""
-    s = dc.ddb()
-    df = s.run(
-        f'''
-        select TRADE_DAYS from loadTable("dfs://WINDDATA_MONTH", "AShareCalendar")
-        where S_INFO_EXCHMARKET = "{_EXCH}"
-        order by TRADE_DAYS asc
-        '''
-    )
-    # TRADE_DAYS is a "YYYYMMDD" string -> Timestamp
-    dates = pd.to_datetime(df["TRADE_DAYS"], format="%Y%m%d")
-    return dates
+def _fetch_all() -> pd.DatetimeIndex:
+    """从 Tushare 拉取全部 SSE 交易日，返回 DatetimeIndex。"""
+    api = pro()
+    df = api.trade_cal(exchange=_EXCH, start_date="19900101", end_date="20301231", is_open="1")
+    if df is None or df.empty:
+        raise RuntimeError("Tushare trade_cal 返回空；请检查 Token 与积分。")
+    # cal_date 为 'YYYYMMDD' 字符串 -> Timestamp
+    dates = pd.to_datetime(df["cal_date"], format="%Y%m%d")
+    return pd.DatetimeIndex(sorted(dates))
 
 
 def _get_all_dates() -> pd.DatetimeIndex:
-    """Get all trading days (with cache)."""
+    """获取全部交易日（带缓存）。"""
     key = cache_key(_CACHE_NAME, _EXCH, "all")
     cached = read_cache(_CACHE_NAME, key)
     if cached is not None:
@@ -45,10 +43,7 @@ def _get_all_dates() -> pd.DatetimeIndex:
 
 
 def trading_dates(start: str | pd.Timestamp, end: str | pd.Timestamp) -> pd.DatetimeIndex:
-    """Return the trading days within [start, end] (closed interval).
-
-    Args may be 'YYYY-MM-DD' strings or Timestamps. Returns an ascending DatetimeIndex.
-    """
+    """返回 [start, end]（闭区间）内的交易日，升序 DatetimeIndex。"""
     all_dates = _get_all_dates()
     start = pd.Timestamp(start)
     end = pd.Timestamp(end)
@@ -57,13 +52,7 @@ def trading_dates(start: str | pd.Timestamp, end: str | pd.Timestamp) -> pd.Date
 
 
 def align_to_trading(date: str | pd.Timestamp, direction: str = "forward") -> pd.Timestamp:
-    """Align a date to the nearest trading day.
-
-    direction:
-        'forward'  -> next trading day on or after the date
-        'backward' -> previous trading day on or before the date
-        'nearest'  -> closest trading day
-    """
+    """把日期对齐到最近的交易日（forward/backward/nearest）。"""
     date = pd.Timestamp(date)
     all_dates = _get_all_dates()
     if direction == "forward":
@@ -79,12 +68,12 @@ def align_to_trading(date: str | pd.Timestamp, direction: str = "forward") -> pd
 
 
 def is_trading_day(date: str | pd.Timestamp) -> bool:
-    """Check whether a date is a trading day."""
+    """判断某天是否为交易日。"""
     return pd.Timestamp(date) in _get_all_dates()
 
 
 def next_trading_day(date: str | pd.Timestamp) -> pd.Timestamp:
-    """Next trading day (excluding the date itself)."""
+    """下一个交易日（不含当天）。"""
     date = pd.Timestamp(date)
     all_dates = _get_all_dates()
     after = all_dates[all_dates > date]
@@ -92,7 +81,7 @@ def next_trading_day(date: str | pd.Timestamp) -> pd.Timestamp:
 
 
 def prev_trading_day(date: str | pd.Timestamp) -> pd.Timestamp:
-    """Previous trading day (excluding the date itself)."""
+    """上一个交易日（不含当天）。"""
     date = pd.Timestamp(date)
     all_dates = _get_all_dates()
     before = all_dates[all_dates < date]

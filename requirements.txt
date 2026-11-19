@@ -6,5 +6,9 @@ pandas>=2.0
 numpy>=1.24
 pyarrow>=14.0
 
-# DolphinDB (market data download; not needed if you supply parquet files directly)
-dolphindb>=3.0
+# 【改动】数据源：Tushare（替代 DolphinDB），获取沪深300日频行情
+# 需要 Tushare Token（2000积分及以上），通过环境变量 TUSHARE_TOKEN 提供。
+tushare>=1.4.0
+
+# 【改动】报告/图表输出：matplotlib（Agg 后端，仅保存 PNG，不弹窗）
+matplotlib>=3.7

@@ -1,15 +1,15 @@
 """Bi-Level Optimization (BLO) for learning label-horizon weights lambda.
 
 Reproduces the core method of ICML 2026 "The Label Horizon Paradox", adapted to
-a multi-day daily-frequency setting:
+a multi-day daily-frequency setting（【改动】回看 10 天序列 + LSTM + h=1..5）:
 
-  - Universe: all A-shares; features: Alpha158 (cross-sectional tanh
-    classification preprocessing).
+  - Universe: 沪深300；features: Alpha158 (cross-sectional tanh
+    classification preprocessing)，输入为过去 LOOKBACK=10 个交易日的序列。
   - Labels: cross-sectional z-score of post-adjusted VWAP returns
-    ``vwap[t+1+h] / vwap[t+1] - 1`` for h = 1..10 (10 candidate horizons).
-  - Inference target: Delta = 10 (10-day VWAP return, aligned with a 10-day
+    ``vwap[t+1+h] / vwap[t+1] - 1`` for h = 1..5 (5 candidate horizons).
+  - Inference target: Delta = 5 (5-day VWAP return, aligned with a 5-day
     rebalancing cadence).
-  - Model: AlphaMLP (158 -> 256 -> 128 -> 1).
+  - Model: AlphaLSTM（序列输入 [B, LOOKBACK, 158] -> hidden -> 1）。
 
 Method:
   - teacher: a shared logits vector lambda in R^Delta, softmax-normalized into
@@ -57,7 +57,7 @@ import torch.nn as nn
 from torch import autograd
 from torch.func import functional_call
 
-from src.model import AlphaMLP, daily_ic, weighted_daily_ic
+from src.model import AlphaLSTM, daily_ic, weighted_daily_ic  # 【改动】AlphaMLP -> AlphaLSTM
 
 __all__ = ["HorizonTeacher", "BLOTrainer"]
 
@@ -86,9 +86,10 @@ class BLOTrainer:
     gradient on lambda. No ``higher`` library is required.
 
     Args:
-        in_dim: feature dimension (158).
-        n_horizons: number of candidate horizons (10).
+        in_dim: 每日特征维度（158；序列第三维）。
+        n_horizons: number of candidate horizons（【改动】5）。
         device: "cuda" / "cpu".
+        hidden_size/num_layers/dropout: LSTM 结构超参（【改动】新增）。
         lr_inner: inner-loop differentiable step learning rate.
         lr_outer: outer-loop lambda learning rate.
         inner_steps: inner-loop steps M. M=1 is the recommended default (also the
@@ -102,9 +103,10 @@ class BLOTrainer:
         gap_days: minimum day gap between the inner and outer date ranges.
     """
 
-    def __init__(self, in_dim, n_horizons=10, device="cuda",
+    def __init__(self, in_dim, n_horizons=5, device="cuda",
                  lr_inner=0.05, lr_outer=0.1, inner_steps=1, inner_momentum=0.9,
-                 entropy_weight=1e-4, batch_days=10, gap_days=10):
+                 entropy_weight=1e-4, batch_days=10, gap_days=10,
+                 hidden_size=64, num_layers=1, dropout=0.2):
         self.device = device
         self.n_horizons = n_horizons
         self.lr_inner = lr_inner
@@ -115,7 +117,9 @@ class BLOTrainer:
         self.batch_days = batch_days
         self.gap_days = gap_days
 
-        self.student = AlphaMLP(in_dim).to(device)
+        # 【改动】学生模型用 LSTM（序列输入 [B, LOOKBACK, D]）。
+        self.student = AlphaLSTM(in_dim, hidden_size=hidden_size,
+                                 num_layers=num_layers, dropout=dropout).to(device)
         self.teacher = HorizonTeacher(n_horizons).to(device)
         self.opt_lambda = torch.optim.Adam(self.teacher.parameters(), lr=lr_outer)
         self._inner_velocity = None
@@ -163,7 +167,9 @@ class BLOTrainer:
         return X[mask], Y_all[mask], date_ids[mask]
 
     def train(self, X, Y_all, date_ids, target_idx, n_iters,
-              val_X=None, val_Y_target=None, val_date_ids=None):
+              val_X=None, val_Y_target=None, val_date_ids=None,
+              train_eval_X=None, train_eval_Y=None,
+              test_X=None, test_Y=None, test_date_ids=None):
         """Random-dispersed sampling training for ``n_iters`` iterations.
 
         Each iteration: pick a random center t_idx; draw the inner set from
@@ -262,8 +268,22 @@ class BLOTrainer:
                     val_ic = daily_ic(pred_v, val_Y_target, val_date_ids).item()
                 else:
                     val_ic = float('nan')
+                # 【改动】损失曲线：train/test 用目标 horizon 标签的 MSE（固定子样本，省时）。
+                if train_eval_X is not None:
+                    train_loss = nn.functional.mse_loss(
+                        self.student(train_eval_X), train_eval_Y).item()
+                else:
+                    train_loss = float('nan')
+                if test_X is not None:
+                    test_loss = nn.functional.mse_loss(
+                        self.student(test_X), test_Y).item()
+                    test_ic = daily_ic(self.student(test_X), test_Y, test_date_ids).item()
+                else:
+                    test_loss = test_ic = float('nan')
             history.append({"iter": it, "lambda": lam_val,
-                            "outer_loss": last_outer_loss, "val_ic": val_ic})
+                            "outer_loss": last_outer_loss, "val_ic": val_ic,
+                            "train_loss": train_loss, "test_loss": test_loss,
+                            "test_ic": test_ic})
             if it % max(1, n_iters // 10) == 0 or it == n_iters - 1:
                 print(f"  [iter {it}/{n_iters}] outer_loss={last_outer_loss:.4f} "
                       f"val_ic={val_ic:.4f} lambda={lam_val.round(3)}", flush=True)

@@ -1,29 +1,25 @@
-"""Compute all-A ALPHA158 factors (DATA_START~DATA_END), save to data/.
+"""计算沪深300的 Alpha158 因子（DATA_START~DATA_END），保存到 data/。
 
-From raw DDB market data, use factors_calculate.alpha158_db.compute_alpha158 to
-compute 158 factors. Computed in batches (about one year per batch, including
-rolling60 warmup), concatenated, de-duplicated, then truncated to the target range.
+（【改动】原为全市场 Alpha158；现改为只算沪深300成分股，数据源 Tushare。）
 
-Date range and output path are read from src/config.py (DATA_START, DATA_END,
-RAW_DATA_DIR).
+从 Tushare 后复权 OHLCV 出发，用 factors_calculate.alpha158_db.compute_alpha158 计算
+158 个因子。按约一年一批（含 rolling-60 预热）计算、拼接、去重，再截断到目标区间。
 
-Outputs (data/a_share_data/):
-  - factors.parquet:       full factors (long: date x wind_code x 158 factors)
-  - tradable_mask.parquet: tradable mask (wide: date x wind_code)
+输出（data/a_share_data/）：
+  - factors.parquet：完整因子（长表：date × wind_code × 158 因子）
 
-Does not overwrite existing files: skipped if the file already exists (unless --force).
+默认不覆盖已存在文件（除非 --force）。
 
-Usage:
-  python scripts/build_factors.py              # compute full (skip if exists)
-  python scripts/build_factors.py --force      # force recompute and overwrite
-  python scripts/build_factors.py --start 2025-01-02 --end 2025-01-10  # custom range
+用法：
+  python scripts/build_factors.py              # 计算（文件已存在则跳过）
+  python scripts/build_factors.py --force      # 强制重算
 """
 from __future__ import annotations
 import sys, warnings, time, argparse
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent  # project root directory
+_ROOT = _HERE.parent
 _SRC = _ROOT / "src"
 for _p in (_HERE, _ROOT, _SRC):
     if str(_p) not in sys.path:
@@ -31,19 +27,18 @@ for _p in (_HERE, _ROOT, _SRC):
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-import numpy as np
 import pandas as pd
 
-from src.config import DATA_START, DATA_END, RAW_DATA_DIR
+from src.config import (
+    DATA_START, DATA_END, RAW_DATA_DIR, UNIVERSE_INDEX_CODE,
+)
 from factors_calculate.alpha158_db import compute_alpha158, ALPHA158_NAMES
-from data_fetch.marketdata_db import get_tradable_mask
-from data_fetch.connection import dc
+from data_fetch.index_members_db import get_index_member_mask
 
-# Batches: about one year per batch, pushed forward for warmup (overlaps with
-# the previous batch for de-dup). Each batch starts 6 months before its target
-# year to provide rolling-60 warmup. Save truncated to DATA_START..DATA_END.
+# 分批：约一年一批，向前推半年做 rolling-60 预热（与上一批有重叠用于去重）。
+# 每批起于目标年前 6 个月，用于滚动窗口预热。保存时截断到 DATA_START..DATA_END。
 BATCHES = [
-    ("2019-01-01", "2020-06-30"),  # 2019-06 warmup + early 2020
+    ("2019-01-01", "2020-06-30"),  # 2019-06 预热 + 2020 上半年
     ("2019-06-01", "2020-12-31"),  # 2020
     ("2020-06-01", "2021-12-31"),  # 2021
     ("2021-06-01", "2022-12-31"),  # 2022
@@ -54,67 +49,57 @@ BATCHES = [
 ]
 
 
-def _save(name: str, df, out_dir: Path, force: bool) -> bool:
-    """Save parquet; skip if it already exists and force is False."""
-    path = out_dir / f"{name}.parquet"
-    if path.exists() and not force:
-        print(f"  [skip] {name}.parquet already exists ({path.stat().st_size/1e6:.1f}M)", flush=True)
-        return False
-    df.to_parquet(path)
-    print(f"  [saved] {name}.parquet shape={df.shape} ({path.stat().st_size/1e6:.1f}M)", flush=True)
-    return True
-
-
 def build(start: str, end: str, out_dir: Path, force: bool, batches=None):
-    """Compute factors in batches + concatenate + truncate + save."""
-    print(f"\n=== Build all-A factors {start}~{end} (each batch has 6-month warmup) ===", flush=True)
-    print(f"  ALPHA158 factor count: {len(ALPHA158_NAMES)}", flush=True)
+    """分批计算因子 + 拼接 + 截断 + 保存。"""
+    path = out_dir / "factors.parquet"
+    if path.exists() and not force:
+        print(f"[skip] factors.parquet 已存在 ({path.stat().st_size/1e6:.1f}M)", flush=True)
+        return
+
+    print(f"\n=== 计算沪深300 Alpha158 因子 {start}~{end}（每批含 6 个月预热） ===", flush=True)
+    print(f"  ALPHA158 因子数：{len(ALPHA158_NAMES)}", flush=True)
+
+    # 沪深300历史成分（全区间并集，无幸存者偏差）。
+    member_mask = get_index_member_mask(UNIVERSE_INDEX_CODE, start, end, force_refresh=force)
+    codes = sorted(member_mask.columns.tolist())
+    print(f"  沪深300历史成分股票数：{len(codes)}", flush=True)
+
     t0 = time.time()
     bs = batches if batches is not None else BATCHES
     parts = []
     for i, (s, e) in enumerate(bs):
-        print(f"[{i+1}/{len(bs)}] Computing factors {s}~{e}...", flush=True)
+        print(f"[{i+1}/{len(bs)}] 计算因子 {s}~{e}...", flush=True)
         t1 = time.time()
-        long_df = compute_alpha158(s, e, index_code=None, codes=None, as_frame="long")
-        print(f"    done: {long_df.shape}, took {time.time()-t1:.0f}s", flush=True)
+        long_df = compute_alpha158(s, e, index_code=None, codes=codes, as_frame="long")
+        print(f"    完成：{long_df.shape}，耗时 {time.time()-t1:.0f}s", flush=True)
         parts.append(long_df)
-    print(f"Concatenating {len(parts)} batches...", flush=True)
+    print(f"拼接 {len(parts)} 批...", flush=True)
     long_df = pd.concat(parts)
-    long_df = long_df[~long_df.index.duplicated(keep="first")]  # de-dup (warmup overlap)
-    print(f"  After concat + de-dup: {long_df.shape}, took {time.time()-t0:.0f}s", flush=True)
+    long_df = long_df[~long_df.index.duplicated(keep="first")]  # 去重（预热重叠）
+    print(f"  拼接+去重后：{long_df.shape}，耗时 {time.time()-t0:.0f}s", flush=True)
 
-    # Truncate to the save range
+    # 截断到保存区间
     dates = long_df.index.get_level_values("date")
     long_df = long_df[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
-    print(f"  Truncated to {start}~{end}: {long_df.shape}", flush=True)
+    print(f"  截断到 {start}~{end}：{long_df.shape}", flush=True)
     per_day = long_df.groupby(level="date").size()
-    print(f"  Stocks per day: min/median/max = {per_day.min()}/{int(per_day.median())}/{per_day.max()}", flush=True)
+    print(f"  每日股票数 min/中位/max = {per_day.min()}/{int(per_day.median())}/{per_day.max()}", flush=True)
 
-    # Save factors
-    _save("factors", long_df, out_dir, force)
-
-    # Get tradable mask
-    print(f"\nGetting tradable mask {start}~{end}...", flush=True)
-    tradable = get_tradable_mask(start, end)
-    factor_dates = long_df.index.get_level_values("date").unique()
-    tradable = tradable.loc[tradable.index.intersection(factor_dates)]
-    _save("tradable_mask", tradable, out_dir, force)
-
-    print(f"\n=== Done, total time {time.time()-t0:.0f}s ===", flush=True)
-    print(f"Outputs saved to: {out_dir}", flush=True)
+    long_df.to_parquet(path)
+    print(f"  [saved] factors.parquet shape={long_df.shape} ({path.stat().st_size/1e6:.1f}M)", flush=True)
+    print(f"\n=== 完成，总耗时 {time.time()-t0:.0f}s ===", flush=True)
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Compute all-A ALPHA158 factors")
-    ap.add_argument("--force", action="store_true", help="force recompute (overwrite existing)")
-    ap.add_argument("--start", default=DATA_START, help=f"start date (default {DATA_START})")
-    ap.add_argument("--end", default=DATA_END, help=f"end date (default {DATA_END})")
+    ap = argparse.ArgumentParser(description="计算沪深300 Alpha158 因子（Tushare）")
+    ap.add_argument("--force", action="store_true", help="强制重算（覆盖已存在文件）")
+    ap.add_argument("--start", default=DATA_START, help=f"开始日期（默认 {DATA_START}）")
+    ap.add_argument("--end", default=DATA_END, help=f"结束日期（默认 {DATA_END}）")
     args = ap.parse_args()
 
     RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"force={args.force} (existing files {'overwritten' if args.force else 'skipped'})", flush=True)
+    print(f"force={args.force}（已存在文件 {'覆盖' if args.force else '跳过'}）", flush=True)
     build(args.start, args.end, RAW_DATA_DIR, args.force)
-    dc.close_ddb()
 
 
 if __name__ == "__main__":

@@ -1,58 +1,66 @@
-"""Index constituents (PIT, Point-in-Time).
+"""指数成分股（PIT，Point-in-Time）——Tushare 实现。
 
-Data source: DDB WINDDATA_MONTH.AIndexMembers.
+数据源：Tushare ``index_weight`` 接口（月度成分快照，2000积分起）。
+根据 S_CON_INDATE/S_CON_OUTDATE 类似的"快照区间"重建逐日成分标记，避免幸存者偏差。
 
-Determines whether a stock is in an index on a given day via the
-S_CON_INDATE/S_CON_OUTDATE interval, with no survivorship bias.
-Supports CSI300 (000300.SH) / CSI500 (000905.SH) / CSI1000 (000852.SH)
-and any Wind index code.
+本项目只做沪深300（000300.SH）。Tushare 的 index_weight 对沪深300可能同时接受
+"000300.SH"（Wind 代码）与 "399300.SZ"（深交所代码）；本模块会先尝试传入的
+index_code，若为空再尝试另一个代码。
 
-Usage:
-    from data_fetch.index_members_db import (
-        get_index_members, get_index_member_mask,
-    )
-    # constituents on a given day
+用法：
+    from data_fetch.index_members_db import get_index_member_mask, get_index_members
+    mask = get_index_member_mask("000300.SH", "2020-01-02", "2026-06-30")
     codes = get_index_members("000300.SH", "2024-06-28")
-    # daily in-index mask over a range (T x N wide table)
-    mask = get_index_member_mask("000300.SH", "2024-01-02", "2024-06-30")
 """
 
 from __future__ import annotations
 
+import time
+
 import pandas as pd
 
 from data_fetch.cache import cache_key, read_cache, write_cache
-from data_fetch.connection import dc
+from data_fetch.calendar_db import trading_dates
+from data_fetch.connection import pro
 
-__all__ = ["get_index_members", "get_index_member_mask", "INDEX_CSI300", "INDEX_CSI500", "INDEX_CSI1000"]
+__all__ = ["get_index_members", "get_index_member_mask", "INDEX_CSI300"]
 
-_MEMBER_TABLE = 'loadTable("dfs://WINDDATA_MONTH", "AIndexMembers")'
-
-# Common index codes
 INDEX_CSI300 = "000300.SH"
-INDEX_CSI500 = "000905.SH"
-INDEX_CSI1000 = "000852.SH"
+
+# 沪深300在 Tushare 里的两个等价代码（用于回退尝试）。
+_CSI300_ALT = "399300.SZ"
 
 
-def _fetch_members(index_code: str) -> pd.DataFrame:
-    """Pull the full historical constituent entry/exit records for an index (long table).
+def _fetch_snapshots(index_code: str, start: str, end: str) -> pd.DataFrame:
+    """拉取指数月度成分快照（长表）。
 
-    Returns:
-        DataFrame[wind_code, entry, remove]: entry/remove are Timestamps;
-        remove being NaT means still in the index today.
+    返回 DataFrame[con_code, trade_date, weight]，trade_date 为 'YYYYMMDD' 字符串。
     """
-    s = dc.ddb()
-    df = s.run(
-        f'''
-        select S_CON_WINDCODE as wind_code, S_CON_INDATE as indate,
-               S_CON_OUTDATE as outdate
-        from {_MEMBER_TABLE}
-        where S_INFO_WINDCODE = "{index_code}"
-        '''
+    api = pro()
+    df = api.index_weight(index_code=index_code, start_date=start, end_date=end)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df[df["con_code"].notna()].copy()
+    df["con_code"] = df["con_code"].astype(str)
+    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "", regex=False)
+    return df[["con_code", "trade_date", "weight"]]
+
+
+def _snapshots_with_fallback(index_code: str, start: str, end: str) -> tuple[pd.DataFrame, str]:
+    """尝试获取快照；若目标代码为空则回退到备选代码。返回 (df, 实际使用的代码)。"""
+    df = _fetch_snapshots(index_code, start, end)
+    if not df.empty:
+        return df, index_code
+    # 沪深300两个代码互备；避免单个代码在 Tushare 侧取不到数据。
+    alt = _CSI300_ALT if index_code.upper() == INDEX_CSI300 else INDEX_CSI300
+    df2 = _fetch_snapshots(alt, start, end)
+    if not df2.empty:
+        print(f"  [index_members] {index_code} 无快照，改用 {alt}")
+        return df2, alt
+    raise RuntimeError(
+        f"index_weight 在 {start}~{end} 无任何快照（尝试了 {index_code} / {alt}）。"
+        "请确认 Token、积分（>=2000）与指数代码。"
     )
-    df["entry"] = pd.to_datetime(df["indate"], format="%Y%m%d", errors="coerce")
-    df["remove"] = pd.to_datetime(df["outdate"], format="%Y%m%d", errors="coerce")
-    return df[["wind_code", "entry", "remove"]]
 
 
 def get_index_member_mask(
@@ -61,19 +69,18 @@ def get_index_member_mask(
     end: str | pd.Timestamp,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Daily in-index constituent mask wide table (True=the stock is in the index on that day).
+    """每日成分标记（宽表：日期 × 股票，True=当日属于该指数）。
 
-    Based on the S_CON_INDATE/S_CON_OUTDATE interval of AIndexMembers (PIT, no
-    survivorship bias). An empty OUTDATE means still in the index today.
+    基于 index_weight 月度快照：每个快照状态延续到下一个快照前一天（阶梯式近似，
+    非交易所公告级精确生效日）。返回 (T x N) bool 表，index=交易日（由交易日历对齐）。
 
     Args:
-        index_code: Wind index code, e.g. "000300.SH" / "000905.SH".
-        start/end: date range.
-        force_refresh: force refresh the cache.
+        index_code: 指数代码，如 "000300.SH"。
+        start/end: 日期范围（闭区间）。
+        force_refresh: 是否强制刷新缓存。
 
     Returns:
-        (T x N) boolean wide table, index=date (trading-day alignment is the
-        caller's responsibility), columns=wind_code.
+        (T x N) bool 宽表，index=交易日，columns=wind_code（含历史进出的全部成分）。
     """
     key = cache_key("idxmember", index_code, str(start), str(end))
     if not force_refresh:
@@ -81,24 +88,40 @@ def get_index_member_mask(
         if cached is not None:
             return cached
 
-    df = _fetch_members(index_code)
+    s = pd.Timestamp(start).strftime("%Y%m%d")
+    e = pd.Timestamp(end).strftime("%Y%m%d")
+    snap, used_code = _snapshots_with_fallback(index_code, s, e)
 
-    # Align the date axis with the trading calendar to avoid non-trading-day rows
-    from data_fetch.calendar_db import trading_dates
+    # 快照按 trade_date 升序；每只股票在某快照区间内视为成分股。
+    snap = snap.sort_values("trade_date")
+    snapshot_dates = sorted(snap["trade_date"].unique())
+    codes = sorted(snap["con_code"].unique())
 
-    dates = trading_dates(start, end)
-    dates = pd.DatetimeIndex(dates)  # ensure it is an Index (Series[-1] would KeyError)
-    codes = sorted(df["wind_code"].unique())
+    # 交易日轴（与回测时间轴一致）。
+    dates = pd.DatetimeIndex(trading_dates(start, end))
     mask = pd.DataFrame(False, index=dates, columns=codes)
-    last_date = dates[-1]
-    for row in df.itertuples():
-        if pd.isna(row.entry):
+
+    # 构造每个快照的生效区间 [snap_date, next_snap_date - 1天]，最后一个延续到 end。
+    for i, snap_date in enumerate(snapshot_dates):
+        interval_start = max(s, snap_date)
+        if i + 1 < len(snapshot_dates):
+            next_dt = pd.to_datetime(snapshot_dates[i + 1], format="%Y%m%d")
+            interval_end = (next_dt - pd.Timedelta(days=1)).strftime("%Y%m%d")
+        else:
+            interval_end = e
+        if interval_start > interval_end:
             continue
-        remove = row.remove if pd.notna(row.remove) else last_date
-        seg = (dates >= row.entry) & (dates <= remove)
-        if row.wind_code in mask.columns:
-            mask.loc[seg, row.wind_code] = True
+        # 该快照当日的成分列表。
+        members = snap[snap["trade_date"] == snap_date]["con_code"].unique()
+        seg = (dates >= pd.to_datetime(interval_start, format="%Y%m%d")) & \
+              (dates <= pd.to_datetime(interval_end, format="%Y%m%d"))
+        for code in members:
+            if code in mask.columns:
+                mask.loc[seg, code] = True
+
     write_cache("idxmember", key, mask)
+    print(f"  [index_members] {used_code} 每日成分掩码：{mask.shape}，"
+          f"日均成分 {int(mask.sum(axis=1).mean())} 只")
     return mask
 
 
@@ -107,16 +130,7 @@ def get_index_members(
     date: str | pd.Timestamp,
     force_refresh: bool = False,
 ) -> list[str]:
-    """In-index constituents of an index on a given trading day (PIT).
-
-    Args:
-        index_code: Wind index code.
-        date: trading day.
-        force_refresh: force refresh the cache.
-
-    Returns:
-        Sorted list of in-index constituent wind_codes on that day.
-    """
+    """某交易日的指数成分股列表（PIT），升序返回 wind_code 列表。"""
     date = pd.Timestamp(date)
     mask = get_index_member_mask(index_code, date, date, force_refresh=force_refresh)
     if date not in mask.index:

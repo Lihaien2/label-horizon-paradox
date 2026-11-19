@@ -1,6 +1,7 @@
 """Model and differentiable IC loss functions.
 
-  - ``AlphaMLP``: the 158 -> 256 -> 128 -> 1 prediction network.
+  - ``AlphaLSTM``: LSTM 时序模型（【改动】回看窗口 10 天的序列输入 -> 隐藏态 -> 1）。
+  - ``AlphaMLP``: 原 MLP（保留作对照，默认入口已切换到 AlphaLSTM）。
   - ``daily_ic``: differentiable daily cross-sectional Pearson IC.
   - ``weighted_daily_ic`` / ``weighted_mse``: weighted multi-horizon losses
     used by the BLO inner loop.
@@ -29,8 +30,38 @@ from src.config import DEVICE
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
+class AlphaLSTM(nn.Module):
+    """【改动】LSTM 时序预测模型。
+
+    输入形状：(Batch, LOOKBACK, D)，其中 LOOKBACK 为回看窗口交易日数（默认 10），
+    D 为每日特征维度（Alpha158 = 158）。
+    取 LSTM 最后一步（或最后一层）的 hidden state 过一层全连接输出标量打分。
+    """
+
+    def __init__(self, in_dim, hidden_size=64, num_layers=1, dropout=0.2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        # batch_first=True：输入 [B, L, D]，输出 [B, L, hidden]。
+        self.lstm = nn.LSTM(
+            input_size=in_dim, hidden_size=hidden_size, num_layers=num_layers,
+            batch_first=True, dropout=(dropout if num_layers > 1 else 0.0),
+        )
+        self.drop = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        # x: [B, L, D]；LSTM 输出 out: [B, L, hidden]，(h_n, c_n) 为末时刻各层隐态。
+        out, (h_n, c_n) = self.lstm(x)
+        last = h_n[-1]  # 最后一层的末时刻隐态 [B, hidden]
+        return self.fc(self.drop(last)).squeeze(-1)
+
+
 class AlphaMLP(nn.Module):
-    """Simple MLP: 158 -> 256 -> 128 -> 1 with ReLU + Dropout."""
+    """（保留作对照）Simple MLP: 158 -> 256 -> 128 -> 1 with ReLU + Dropout.
+
+    注意：回看窗口改为 10 天后默认不再使用该模型；若要用它需先把序列展平。
+    """
 
     def __init__(self, in_dim, hidden=(256, 128), dropout=0.2):
         super().__init__()

@@ -1,17 +1,17 @@
 <h1 align="center">Data Pipeline</h1>
 
-This document describes the data layer: market data, Alpha158 factors, label
-construction, and factor preprocessing.
+This document describes the data layer: market data (Tushare), Alpha158 factors,
+label construction, and factor preprocessing（当前为 **沪深300 + 回看10天 + ffill** 版本）。
 
 ## Overview
 
 All market data is read from parquet files under `data/a_share_data/` at
 runtime — no database connection is needed for training/backtesting. The
-download scripts (`scripts/build_*.py`) pull from DolphinDB once and cache
+download scripts (`scripts/build_*.py`) pull from **Tushare** once and cache
 locally.
 
 ```
-DolphinDB ──build_backtest_data.py──> data/a_share_data/ (raw parquet)
+Tushare ──build_backtest_data.py──> data/a_share_data/ (raw parquet, CSI300)
                                         │
               build_factors.py ─────────┤  (compute Alpha158)
                                         │
@@ -20,22 +20,35 @@ DolphinDB ──build_backtest_data.py──> data/a_share_data/ (raw parquet)
               run_search / run_blo ──────┴──> training
 ```
 
+## Data Source: Tushare（2000积分档）
+
+Token 从环境变量 `TUSHARE_TOKEN` 读取。用到的接口与积分要求：
+
+| 接口 | 用途 | 积分 |
+|---|---|---|
+| `daily` | 日线 OHLCV | 120 起 |
+| `adj_factor` | 复权因子 | 2000 起 |
+| `index_weight` | 指数月度成分（PIT） | 2000 起 |
+| `suspend_d` | 每日停复牌 | 2000 起 |
+| `trade_cal` | 交易日历 | 基础 |
+| `index_daily` | 指数日线（基准） | 基础 |
+
+> `limit_list_d`（精确涨跌停）需 **5000 积分**，2000 档不可用；本项目用"收盘价 vs
+> 前收盘价"按板块涨跌停幅度近似（主板10%、创业板20%、科创板20%）。
+
 ## Data Layout
 
-`data/a_share_data/` (raw, downloaded from DDB):
+`data/a_share_data/`（原始，来自 Tushare，仅沪深300历史成分）：
 
 | File | Shape | Description |
 |---|---|---|
-| `adjclose.parquet` | T × N (wide) | Post-adjusted close price (NAV mark + return calc) |
-| `vwap_adj.parquet` | T × N | Post-adjusted VWAP = raw VWAP × adjustment factor (trade price + label) |
-| `limit_up.parquet` | T × N | Limit-up mask (cannot buy) |
-| `limit_down.parquet` | T × N | Limit-down mask (cannot sell) |
-| `tradable_mask.parquet` | T × N | Tradable mask (excludes suspended stocks) |
-| `member_mask_csi300.parquet` | T × N | CSI300 daily constituent mask (PIT) |
-| `member_mask_csi500.parquet` | T × N | CSI500 daily constituent mask (PIT) |
-| `member_mask_csi1000.parquet` | T × N | CSI1000 daily constituent mask (PIT) |
-| `index_label.parquet` | T × N | 0/1/2/3 index label (synthesized from the three masks) |
-| `index_close.parquet` | T × 3 | CSI300/500/1000 daily close (benchmark) |
+| `adjclose.parquet` | T × N (wide) | 后复权收盘价（= raw close × adj_factor；NAV 标记 + 收益计算） |
+| `vwap_adj.parquet` | T × N | 后复权 VWAP = amount×10/vol × adj_factor（成交价 + 标签） |
+| `limit_up.parquet` | T × N | 涨停掩码（近似，见上） |
+| `limit_down.parquet` | T × N | 跌停掩码（近似） |
+| `tradable_mask.parquet` | T × N | 可交易掩码（非停牌：suspend_d + 日线行存在） |
+| `member_mask_csi300.parquet` | T × N | 沪深300逐日成分掩码（PIT，月度快照阶梯近似） |
+| `index_close.parquet` | T × 1 | 沪深300日收盘（基准） |
 | `factors.parquet` | long (date, code) × 158 | Alpha158 factors |
 
 `data/a_share_data_processed/`:
@@ -53,41 +66,28 @@ Defined in `src/config.py`:
 | `DATA_START` | 2019-06-01 | Data build start (half-year before train, for rolling-60 warmup) |
 | `DATA_END` | 2026-06-30 | Data build end |
 | `TRAIN_START` / `TRAIN_END` | 2020-01-02 / 2023-12-31 | Training |
-| `VALID_START` / `VALID_END` | 2024-01-02 / 2024-12-31 | Validation (best-epoch selection) |
+| `VALID_START` / `VALID_END` | 2024-01-02 / 2024-12-31 | Validation |
 | `TEST_START` / `TEST_END` | 2025-01-02 / 2026-06-30 | Test (final eval + backtest) |
 
 Label quantile thresholds and factor de-extreme thresholds are computed on
-`TRAIN_START..TRAIN_END` only — look-ahead safe for valid/test.
+`TRAIN_START..TRAIN_END` only.
 
 ## Alpha158 Factors
 
 `factors_calculate/alpha158.py` defines the 158 factor names (consistent with
-Qlib):
-
-- **9 candlestick pattern** features (KMID, KLEN, ...).
-- **4 same-day price ratios** (OPEN0, HIGH0, LOW0, VWAP0).
-- **29 rolling templates × 5 windows** (5,10,20,30,60) = 145 features (ROC, MA,
-  STD, BETA, RSQR, RESI, MAX, MIN, QTLU, QTLD, RANK, RSV, IMAX, IMIN, IMXD,
-  CORR, CORD, CNTP, CNTN, CNTD, SUMP, SUMN, SUMD, VMA, VSTD, WVMA, VSUMP,
-  VSUMN, VSUMD).
-
-Computation (`factors_calculate/alpha158_db.py`) pulls raw OHLCV from DDB and
-computes factors in yearly batches with rolling-60 warmup, concatenated and
-de-duplicated.
+Qlib). Computation (`factors_calculate/alpha158_db.py`) pulls **post-adjusted
+OHLCV from Tushare** (`marketdata_db.get_adj_ohlcv`) and computes factors in
+yearly batches with rolling-60 warmup, concatenated and de-duplicated.
 
 ## Factor Preprocessing
 
-`src/data_utils.py:load_factors_tanhw` applies **intrinsic-class preprocessing**
-(not a blanket z-score):
+`src/data_utils.py:load_factors_tanhw` applies **intrinsic-class preprocessing**:
 
 - **69 heavy-tailed factors** (price ratios, MA, ROC, etc.): cross-sectional
-  `tanh(median / (IQR·2))` — compresses outliers to `[-1, 1]`. Outliers beyond train-set `q001/q999` are set to NaN.
-- **89 bounded factors** (candlestick ratios, statistics): kept as-is (already
-  bounded in `[-1, 1]` or stable scale).
+  `tanh(median / (IQR·2))`; outliers beyond train-set `q001/q999` set to NaN.
+- **89 bounded factors** (candlestick ratios, statistics): kept as-is.
 
-This avoids the distortion that a blanket z-score introduces on heavy-tailed
-factors. The preprocessed cache is built once by
-`scripts/cache_factors_processed.py`.
+The preprocessed cache is built once by `scripts/cache_factors_processed.py`.
 
 ## Labels
 
@@ -97,59 +97,40 @@ Post-adjusted VWAP return (`src/data_utils.py:make_label`):
 r_h[t] = vwap_adj[t+h+1] / vwap_adj[t+1] - 1
 ```
 
-The `+1` offset aligns the entry at next-day VWAP (signal at `t` close →
-execute at `t+1` VWAP). Labels are:
+The `+1` offset aligns entry at next-day VWAP. Labels are:
 
-1. **Quantile-trimmed**: samples outside `[q0.5, q99.5]` (per-horizon, train-set
-   thresholds) are set to NaN — prevents extremes from polluting the
-   cross-sectional z-score.
+1. **Quantile-trimmed**: outside `[q0.5, q99.5]` (per-horizon, train-set) → NaN.
 2. **Cross-sectional z-score + clip ±3**: per-day, per-horizon.
 
-For BLO warmup, a **diff-z label** is used: `d_1=r_1, d_2=r_2-r_1, ...,
-d_10=r_10-r_9`, z-scored + clipped + equal-weighted mean → single scalar label.
+Candidate horizons are now **h = 1..5**; the inference target is **Δ = 5**.
+
+## Lookback Window & Suspension Handling（【改动】）
+
+The model input is a sequence of the past **`LOOKBACK = 10`** trading days of
+factors (`[N, 10, 158]`). Building it (`src/data_utils.py`):
+
+1. `prepare_factor_series` aligns each stock's factor series to the full trading
+   calendar and **forward-fills (ffill)** suspension gaps along time (causal).
+2. A stock must have a complete 10-day window (no leading NaN, e.g. newly listed)
+   to be scored; otherwise it is dropped on that day.
 
 ## Data Availability
 
-This repo does **not** redistribute market data due to licensing. The `data/`
-directory is gitignored.
-
-The build scripts (`scripts/build_backtest_data.py`, `scripts/build_factors.py`)
-pull from an internal DolphinDB instance and are provided **for reference only**:
-the DDB connection itself is not accessible. To run the pipeline you have two
-options:
-
-1. **Construct the parquet files yourself** following the layout above and place
-   them under `data/a_share_data/`. The training/backtest code only reads
-   parquet — any source that produces the same schema works.
-2. **Adapt the build scripts** to your own data source (e.g. another market-data
-   vendor or your own database). The `data_fetch/` module isolates all data
-   access; replace its internals and the rest of the pipeline is unchanged.
-
-## Build Scripts (reference)
+This repo does **not** redistribute market data. The `data/` directory is gitignored.
+Set `TUSHARE_TOKEN` and run `scripts/build_backtest_data.py` to fetch CSI300 data.
 
 ```bash
-# Market data + index constituents (needs DDB)
-python scripts/build_backtest_data.py            # download missing (skip existing)
-python scripts/build_backtest_data.py --force    # force re-download
-
-# Alpha158 factors (needs DDB)
-python scripts/build_factors.py
-
-# Preprocess factors (one-time)
-python scripts/cache_factors_processed.py
+export TUSHARE_TOKEN=你的token
+python scripts/build_backtest_data.py            # market data + CSI300 constituents
+python scripts/build_factors.py                  # Alpha158 factors
+python scripts/cache_factors_processed.py        # preprocess factors
 ```
 
-`build_backtest_data.py` does not overwrite existing files by default — only
-missing files are downloaded. Use `--force` to re-download everything.
+`build_backtest_data.py` does not overwrite existing files by default; use `--force`.
 
-## DolphinDB Connection (reference)
+## Build Scripts (Tushare)
 
-`data_fetch/connection.py` holds the DDB connection config (internal, not
-accessible). `data_fetch/` provides:
-
-- `marketdata_db.py`: EOD prices, VWAP, limit status, tradable mask, index close.
-- `index_members_db.py`: index constituent masks (PIT).
-- `calendar_db.py`: trading calendar.
-
-These modules document the data access patterns used to build the parquet
-files; adapt them to your own data source if needed.
+- `data_fetch/connection.py`: Tushare token + `pro()`.
+- `data_fetch/marketdata_db.py`: daily OHLCV, adj factor, VWAP (amount/vol), limit status, tradable, index close.
+- `data_fetch/index_members_db.py`: CSI300 daily constituent masks (PIT, `index_weight` monthly snapshots).
+- `data_fetch/calendar_db.py`: trading calendar (`trade_cal`).

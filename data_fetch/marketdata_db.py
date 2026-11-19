@@ -1,403 +1,362 @@
-"""Market data layer.
+"""行情数据层（Tushare 实现，【改动】替代原 DolphinDB）。
 
-Data sources:
-  - Daily: DDB WINDDATA_MONTH.AShareEODPrices (main market data, DOUBLE prices,
-    with built-in adjustment / limit status / trading status)
-  - Minute: DDB OLAP_Minute.minute (INT prices need /10000, used for intraday
-    signals / execution)
+数据源（Tushare Pro API，2000积分及以上）：
+  - daily        ：日线 OHLCV（open/high/low/close/vol/amount/pre_close/pct_chg）
+  - adj_factor   ：复权因子（2000积分起）
+  - suspend_d    ：每日停复牌（2000积分起）
+  - index_daily  ：指数日线（用于基准收益）
 
-All market data is returned as **wide tables** (index=date, columns=wind_code),
-matching the matrix shape of the vectorized engine. Comes with local parquet cache.
+所有行情统一返回 **宽表**（index=date，columns=wind_code/ts_code），与向量化回测引擎
+的矩阵形状一致；并带本地 parquet 缓存。
 
-Key conventions:
-  - Returns are computed from post-adjusted prices by default to avoid ex-dividend gaps.
-  - Limit up/down detection: S_DQ_CLOSE >= S_DQ_LIMIT (limit up, cannot buy) /
-    <= S_DQ_STOPPING (limit down, cannot sell).
-  - Minute-bar prices are also INT and need /10000; time is of TIME type,
-    filtered by minute(time) for the window.
+关键约定（与论文/demo 对齐）：
+  - 收益用"后复权"价格计算（避免除权缺口）：adj_price = raw_price * adj_factor。
+  - VWAP：日线无直接 VWAP，用成交额/成交量近似：vwap(元/股) = amount*10 / vol。
+    （tushare 中 amount 单位千元、vol 单位手，故 amount*1000/(vol*100)=amount*10/vol）
+    后复权 VWAP = vwap_raw * adj_factor。
+  - 停牌：tushare daily 不含停牌日（无行），并用 suspend_d 显式剔除停牌日。
+  - 涨跌停：limit_list_d 需 5000 积分，2000 积分档不可用，故由收盘价 vs 前收盘价
+    按板块涨跌停幅度近似（主板10%、创业板300xxx自2020-08-24起20%）。见
+    ``_limit_ratio``。若你有 5000+ 积分，可改用 limit_list_d 获得精确涨跌停。
 """
 
 from __future__ import annotations
 
+import os
+import time
+
+import numpy as np
 import pandas as pd
 
 from data_fetch.cache import cache_key, read_cache, write_cache
-from data_fetch.connection import dc
+from data_fetch.connection import pro
 
 __all__ = [
-    # daily
-    "get_eod_prices",
-    "get_returns",
+    "get_adj_ohlcv",
+    "get_adjclose",
+    "get_vwap_adj",
     "get_limit_status",
     "get_tradable_mask",
-    "get_volume",
-    # index
     "get_index_close",
-    # minute
-    "get_minute_vwap",
-    "get_minute_volume",
-    "get_minute_returns",
-    "get_minute_price",
+    "get_universe_ohlcv_long",
 ]
 
-_DAY_TABLE = 'loadTable("dfs://WINDDATA_MONTH", "AShareEODPrices")'
-_MIN_TABLE = 'loadTable("dfs://OLAP_Minute", "minute")'
-_PRICE_SCALE = 10000  # minute-bar INT price scale factor
+# 每次接口调用的间隔（秒），避免触发 Tushare 频控；可用环境变量 TUSHARE_SLEEP 覆盖。
+REQUEST_INTERVAL = float(os.environ.get("TUSHARE_SLEEP", "0.12"))
 
 
-# ───────────────────────── Daily market data ─────────────────────────
+def _rate_limit() -> None:
+    """调用 Tushare 接口前的简单限速（2000积分档主要受 suspend_d 200次/分钟限制）。"""
+    time.sleep(REQUEST_INTERVAL)
 
 
-def _ddb_date_range(start: str | pd.Timestamp, end: str | pd.Timestamp) -> str:
-    """Generate a DDB date range literal: 2024.01.01:2024.12.31."""
-    s = pd.Timestamp(start).strftime("%Y.%m.%d")
-    e = pd.Timestamp(end).strftime("%Y.%m.%d")
-    return f"{s}:{e}"
+def _ts_range(start: str | pd.Timestamp, end: str | pd.Timestamp) -> tuple[str, str]:
+    """把起止日期转成 Tushare 需要的 'YYYYMMDD' 字符串。"""
+    s = pd.Timestamp(start).strftime("%Y%m%d")
+    e = pd.Timestamp(end).strftime("%Y%m%d")
+    return s, e
 
 
-def _fetch_eod(
+# ───────────────────────── 原始数据抓取（长表，带缓存） ─────────────────────────
+
+
+def get_universe_ohlcv_long(
+    codes: list[str],
     start: str | pd.Timestamp,
     end: str | pd.Timestamp,
-    fields: list[str],
-) -> pd.DataFrame:
-    """Pull a daily market data long table from DDB; returns a long table with wind_code/TRADE_DT + the specified fields."""
-    field_str = ", ".join(["S_INFO_WINDCODE", "TRADE_DT", *fields])
-    dr = _ddb_date_range(start, end)
-    s = dc.ddb()
-    df = s.run(
-        f'''
-        select {field_str} from {_DAY_TABLE}
-        where TRADE_DT between {dr}
-        '''
-    )
-    return df
-
-
-def _to_wide(long_df: pd.DataFrame, value_col: str) -> pd.DataFrame:
-    """Long table -> wide table (index=TRADE_DT, columns=wind_code, values=value_col)."""
-    return long_df.pivot(index="TRADE_DT", columns="S_INFO_WINDCODE", values=value_col).sort_index()
-
-
-def get_eod_prices(
-    start: str | pd.Timestamp,
-    end: str | pd.Timestamp,
-    field: str = "S_DQ_ADJCLOSE",
-    codes: list[str] | None = None,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Daily price wide table (index=date, columns=wind_code).
+    """逐只股票抓取日线 + 复权因子，返回合并后的长表。
 
-    Args:
-        field: price field, default S_DQ_ADJCLOSE (post-adjusted close). Options:
-            S_DQ_CLOSE (raw close) / S_DQ_OPEN / S_DQ_ADJOPEN (post-adjusted open), etc.
-        codes: specify tickers; None = whole market.
-        force_refresh: force refresh the cache.
+    返回列：ts_code, trade_date, open, high, low, close, pre_close, pct_chg,
+            vol, amount, adj_factor, vwap_raw, vwap_adj。
 
-    Returns a wide table with date as index and wind_code as columns.
+    说明：tushare 的 daily 不含停牌日（停牌日无行），故"有无行"即近似可交易。
     """
-    key = cache_key("eod", field, str(start), str(end))
+    key = cache_key("universe_ohlcv", "|".join(sorted(codes)), str(start), str(end))
     if not force_refresh:
-        cached = read_cache("eod", key)
+        cached = read_cache("universe_ohlcv", key)
         if cached is not None:
-            df = cached
+            return cached
+
+    api = pro()
+    s, e = _ts_range(start, end)
+    parts = []
+    n = len(codes)
+    for i, code in enumerate(codes, 1):
+        _rate_limit()
+        try:
+            d = api.daily(ts_code=code, start_date=s, end_date=e)
+        except Exception as ex:  # 单只失败不中断，记录后继续
+            print(f"  [warn] daily {code} 失败: {ex}")
+            continue
+        if d is None or d.empty:
+            continue
+
+        _rate_limit()
+        try:
+            af = api.adj_factor(ts_code=code, start_date=s, end_date=e)
+        except Exception as ex:
+            af = None
+            print(f"  [warn] adj_factor {code} 失败: {ex}")
+
+        d = d.copy()
+        d["trade_date"] = d["trade_date"].astype(str)
+        if af is not None and not af.empty:
+            af = af.copy()
+            af["trade_date"] = af["trade_date"].astype(str)
+            d = d.merge(af[["trade_date", "adj_factor"]], on="trade_date", how="left")
         else:
-            df = _to_wide(_fetch_eod(start, end, [field]), field)
-            write_cache("eod", key, df)
-    else:
-        df = _to_wide(_fetch_eod(start, end, [field]), field)
-        write_cache("eod", key, df)
-    if codes is not None:
-        codes_set = set(codes)
-        df = df[[c for c in df.columns if c in codes_set]]
-    return df
+            d["adj_factor"] = np.nan
+
+        # 后复权 OHLC（原始价格 × 复权因子）。
+        for col in ("open", "high", "low", "close"):
+            d[f"{col}_adj"] = d[col] * d["adj_factor"]
+        # VWAP 近似：amount(千元)*10 / vol(手) = 元/股；再后复权。
+        d["vwap_raw"] = np.where(d["vol"] > 0, d["amount"] * 10.0 / d["vol"], np.nan)
+        d["vwap_adj"] = d["vwap_raw"] * d["adj_factor"]
+
+        parts.append(d)
+        if i % 50 == 0 or i == n:
+            print(f"  [ohlcv] 已抓取 {i}/{n} 只", flush=True)
+
+    if not parts:
+        raise RuntimeError("未抓到任何股票日线；请检查 Token、积分与股票代码。")
+    long = pd.concat(parts, ignore_index=True)
+    long["ts_code"] = long["ts_code"].astype(str)
+    write_cache("universe_ohlcv", key, long)
+    return long
 
 
-def get_returns(
+def get_suspend_long(
+    codes: list[str],
     start: str | pd.Timestamp,
     end: str | pd.Timestamp,
-    field: str = "S_DQ_ADJCLOSE",
-    codes: list[str] | None = None,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Daily return wide table (pct_change based on adjusted prices).
+    """抓取每日停牌记录（长表：ts_code, trade_date, suspend_type）。
 
-    Returns a (T x N) return matrix, matching the shape of the vectorized engine.
+    suspend_type == 'S' 表示当日停牌。用于构建 tradable_mask。
     """
-    px = get_eod_prices(start, end, field=field, codes=codes, force_refresh=force_refresh)
-    return px.pct_change(fill_method=None)
+    key = cache_key("suspend", "|".join(sorted(codes)), str(start), str(end))
+    if not force_refresh:
+        cached = read_cache("suspend", key)
+        if cached is not None:
+            return cached
+
+    api = pro()
+    s, e = _ts_range(start, end)
+    parts = []
+    for code in codes:
+        _rate_limit()
+        try:
+            d = api.suspend_d(ts_code=code, start_date=s, end_date=e)
+        except Exception as ex:
+            print(f"  [warn] suspend_d {code} 失败（继续，缺省视为可交易）: {ex}")
+            continue
+        if d is None or d.empty:
+            continue
+        d = d.copy()
+        d["trade_date"] = d["trade_date"].astype(str)
+        d["ts_code"] = d["ts_code"].astype(str)
+        parts.append(d[["ts_code", "trade_date", "suspend_type"]])
+    if not parts:
+        # 无停牌记录时返回空表（全部视为可交易）。
+        return pd.DataFrame(columns=["ts_code", "trade_date", "suspend_type"])
+    out = pd.concat(parts, ignore_index=True)
+    write_cache("suspend", key, out)
+    return out
+
+
+# ───────────────────────── 宽表构建 ─────────────────────────
+
+
+def _long_to_wide(long: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """长表 -> 宽表（index=trade_date[Timestamp], columns=ts_code）。
+
+    注意：把 'YYYYMMDD' 字符串索引转成 DatetimeIndex，便于下游用 Timestamp 切片对齐。
+    """
+    wide = long.pivot(index="trade_date", columns="ts_code", values=value_col).sort_index()
+    wide.index = pd.to_datetime(wide.index, format="%Y%m%d")
+    return wide
+
+
+def get_adj_ohlcv(
+    codes: list[str],
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+    force_refresh: bool = False,
+) -> dict[str, pd.DataFrame]:
+    """后复权 OHLCV 宽表字典。
+
+    返回 {open, high, low, close, vwap, volume} 六个 (T x N) 宽表（均后复权，
+    vwap 为后复权 VWAP，volume 为原始成交量（手））。用于 Alpha158 因子计算。
+    """
+    long = get_universe_ohlcv_long(codes, start, end, force_refresh=force_refresh)
+    return {
+        "open": _long_to_wide(long, "open_adj"),
+        "high": _long_to_wide(long, "high_adj"),
+        "low": _long_to_wide(long, "low_adj"),
+        "close": _long_to_wide(long, "close_adj"),
+        "vwap": _long_to_wide(long, "vwap_adj"),
+        "volume": _long_to_wide(long, "vol"),
+    }
+
+
+def get_adjclose(
+    codes: list[str],
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """后复权收盘价宽表（用于 NAV 标记与收益计算）。"""
+    return get_adj_ohlcv(codes, start, end, force_refresh=force_refresh)["close"]
+
+
+def get_vwap_adj(
+    codes: list[str],
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """后复权 VWAP 宽表（用于成交价与标签计算）。"""
+    return get_adj_ohlcv(codes, start, end, force_refresh=force_refresh)["vwap"]
+
+
+def _limit_ratio(code: str, date: pd.Timestamp) -> float:
+    """返回某股票在某日的涨跌停幅度。
+
+    主板 10%；创业板（300/301 开头）自 2020-08-24 起 20%（此前 10%）；
+    科创板（688/689）20%（沪深300通常不含）。ST 股 5% 未单独处理（沪深300无 ST）。
+    """
+    if code.startswith(("688", "689")):
+        return 0.20
+    if code.startswith(("300", "301")):
+        return 0.20 if date >= pd.Timestamp("2020-08-24") else 0.10
+    return 0.10
 
 
 def get_limit_status(
+    codes: list[str],
     start: str | pd.Timestamp,
     end: str | pd.Timestamp,
     force_refresh: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Limit up/down status matrices.
+    """涨跌停状态矩阵（limit_up, limit_down），由收盘价 vs 前收盘价近似。
 
-    Returns (limit_up, limit_down), two (T x N) boolean matrices:
-        limit_up=True  -> limit up (cannot buy)
-        limit_down=True -> limit down (cannot sell)
-    Detection: S_DQ_CLOSE >= S_DQ_LIMIT (limit up) / <= S_DQ_STOPPING (limit down).
+    limit_up   = close >= round(pre_close * (1 + limit), 2)（涨停价）
+    limit_down = close <= round(pre_close * (1 - limit), 2)（跌停价）
+
+    （limit_list_d 需 5000 积分，2000 档不可用；此处用价格近似，详见模块 docstring。）
     """
     key_up = cache_key("limit_up", str(start), str(end))
     key_dn = cache_key("limit_dn", str(start), str(end))
     if not force_refresh:
-        cu = read_cache("limit_up", key_up)
-        cd = read_cache("limit_dn", key_dn)
+        cu, cd = read_cache("limit_up", key_up), read_cache("limit_dn", key_dn)
         if cu is not None and cd is not None:
             return cu, cd
-    df = _fetch_eod(start, end, ["S_DQ_CLOSE", "S_DQ_LIMIT", "S_DQ_STOPPING"])
-    close = _to_wide(df, "S_DQ_CLOSE")
-    lim = _to_wide(df, "S_DQ_LIMIT")
-    stop = _to_wide(df, "S_DQ_STOPPING")
-    # Align the three tables to the same index/columns
-    lim = lim.reindex(index=close.index, columns=close.columns)
-    stop = stop.reindex(index=close.index, columns=close.columns)
-    limit_up = (close >= lim).fillna(False)
-    limit_down = (close <= stop).fillna(False)
+
+    long = get_universe_ohlcv_long(codes, start, end, force_refresh=force_refresh)
+    close = _long_to_wide(long, "close")
+    pre_close = _long_to_wide(long, "pre_close")
+
+    # 逐日逐股计算涨跌停幅度（按板块）。为效率，先把代码映射为每日幅度矩阵。
+    dates = close.index
+    col_ratio = pd.DataFrame(1.0, index=dates, columns=close.columns)
+    for code in close.columns:
+        col_ratio[code] = _limit_ratio(code, pd.Timestamp(dates[-1]))  # 近似用末日期判断板块
+    # 创业板 2020-08-24 之前为 10%，之后为 20%：对 300/301 代码按日期分段修正。
+    for code in close.columns:
+        if code.startswith(("300", "301")):
+            before = dates < pd.Timestamp("2020-08-24")
+            col_ratio.loc[before, code] = 0.10
+            col_ratio.loc[~before, code] = 0.20
+
+    # 涨跌停价（四舍五入到分，与交易所规则一致）。
+    limit_up_price = (pre_close * (1 + col_ratio)).round(2)
+    limit_down_price = (pre_close * (1 - col_ratio)).round(2)
+
+    limit_up = (close >= limit_up_price).fillna(False)
+    limit_down = (close <= limit_down_price).fillna(False)
     write_cache("limit_up", key_up, limit_up)
     write_cache("limit_dn", key_dn, limit_down)
     return limit_up, limit_down
 
 
 def get_tradable_mask(
+    codes: list[str],
     start: str | pd.Timestamp,
     end: str | pd.Timestamp,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Tradable mask wide table (True=tradable).
+    """可交易掩码宽表（True=可交易，即非停牌）。
 
-    Excludes suspended stocks (S_DQ_TRADESTATUS == '停牌'). Limit-up/down lock
-    is handled separately by the constraints module by trade direction (cannot
-    buy at limit up, cannot sell at limit down); not excluded here.
+    停牌判定：tushare daily 停牌日无行（close 为 NaN）；再叠加 suspend_d 的
+    suspend_type=='S' 显式剔除。二者取交集。
     """
     key = cache_key("tradable", str(start), str(end))
     if not force_refresh:
         cached = read_cache("tradable", key)
         if cached is not None:
             return cached
-    df = _fetch_eod(start, end, ["S_DQ_TRADESTATUS"])
-    mask = _to_wide(df, "S_DQ_TRADESTATUS")
-    tradable = mask != "停牌"
+
+    long = get_universe_ohlcv_long(codes, start, end, force_refresh=force_refresh)
+    close = _long_to_wide(long, "close")
+    tradable = close.notna()  # 有日线行 => 当日有交易
+
+    # 显式剔除 suspend_d 记录的停牌日（如接口可用）。
+    susp = get_suspend_long(codes, start, end, force_refresh=force_refresh)
+    if not susp.empty:
+        susp_s = susp[susp["suspend_type"] == "S"]
+        if not susp_s.empty:
+            susp_wide = susp_s.pivot_table(
+                index="trade_date", columns="ts_code", values="suspend_type",
+                aggfunc="count", fill_value=0,
+            ).sort_index()
+            susp_wide.index = pd.to_datetime(susp_wide.index, format="%Y%m%d")  # 对齐 DatetimeIndex
+            susp_flag = susp_wide.reindex(index=close.index, columns=close.columns).fillna(0) > 0
+            tradable = tradable & (~susp_flag)
+
     tradable = tradable.fillna(False)
     write_cache("tradable", key, tradable)
     return tradable
 
 
-def get_volume(
-    start: str | pd.Timestamp,
-    end: str | pd.Timestamp,
-    force_refresh: bool = False,
-) -> pd.DataFrame:
-    """Daily volume wide table (unit: lots, S_DQ_VOLUME). Used for volume participation constraints."""
-    key = cache_key("dayvol", str(start), str(end))
-    if not force_refresh:
-        cached = read_cache("dayvol", key)
-        if cached is not None:
-            return cached
-    df = _fetch_eod(start, end, ["S_DQ_VOLUME"])
-    wide = _to_wide(df, "S_DQ_VOLUME")
-    write_cache("dayvol", key, wide)
-    return wide
-
-
-# ───────────────────────── Minute market data ─────────────────────────
-
-
-def _fetch_minute_window(
-    start: str | pd.Timestamp,
-    end: str | pd.Timestamp,
-    window: tuple[str, str] | None,
-    agg: str,
-) -> pd.DataFrame:
-    """Aggregate the minute-bar table by window; returns a long table (wind_code, date, value).
-
-    agg: 'vwap' -> turover.sum()/volumw.sum()
-         'volume' -> volumw.sum()
-    window: e.g. ('10:30','11:30'); None = full day.
-    """
-    dr = _ddb_date_range(start, end)
-    if agg == "vwap":
-        # Note: turover/volumw are both BIGINT; DDB integer division truncates
-        # decimals (e.g. 11.55 -> 11). Must cast to double() before dividing,
-        # otherwise VWAP is all integers (placeholder values), deviating from
-        # close by >5% and being judged invalid.
-        val_expr = "double(turover.sum()) / double(volumw.sum())"
-        val_col = "vwap"
-    elif agg == "volume":
-        val_expr = "volumw.sum()"
-        val_col = "volume"
-    else:
-        raise ValueError(f"agg must be vwap/volume, got {agg}")
-
-    where_time = ""
-    if window is not None:
-        t0, t1 = window
-        # DDB pair syntax: minute(time) between 10:30m:11:30m (both ends are MINUTE type)
-        where_time = f" and minute(time) between {t0}m:{t1}m"
-
-    sql = f'''
-        select wind_code, date, {val_expr} as {val_col}
-        from {_MIN_TABLE}
-        where date between {dr}{where_time}
-        group by wind_code, date
-    '''
-    s = dc.ddb()
-    df = s.run(sql)
-    # VWAP = turover (yuan) / volumw (shares); already real yuan/shares, no /10000 needed.
-    # (Only the OHLC price fields are INT and need /10000; turover/volumw are real values.)
-    return df
-
-
-def get_minute_vwap(
-    start: str | pd.Timestamp,
-    end: str | pd.Timestamp,
-    window: tuple[str, str] | None = None,
-    force_refresh: bool = False,
-) -> pd.DataFrame:
-    """Window VWAP wide table (index=date, columns=wind_code).
-
-    VWAP = turnover (yuan) / volume (shares); both are real values, no /10000
-    scaling (only OHLC INT fields need /10000).
-    window: e.g. ('10:30','11:30') / ('14:50','15:00'); None = full-day VWAP.
-    """
-    wkey = "all" if window is None else f"{window[0]}-{window[1]}"
-    key = cache_key("mvwap", wkey, str(start), str(end))
-    if not force_refresh:
-        cached = read_cache("mvwap", key)
-        if cached is not None:
-            return cached
-    df = _fetch_minute_window(start, end, window, "vwap")
-    wide = df.pivot(index="date", columns="wind_code", values="vwap").sort_index()
-    write_cache("mvwap", key, wide)
-    return wide
-
-
-def get_minute_volume(
-    start: str | pd.Timestamp,
-    end: str | pd.Timestamp,
-    window: tuple[str, str] | None = None,
-    force_refresh: bool = False,
-) -> pd.DataFrame:
-    """Window volume wide table (unit: shares). Used for volume participation constraints."""
-    wkey = "all" if window is None else f"{window[0]}-{window[1]}"
-    key = cache_key("mvol", wkey, str(start), str(end))
-    if not force_refresh:
-        cached = read_cache("mvol", key)
-        if cached is not None:
-            return cached
-    df = _fetch_minute_window(start, end, window, "volume")
-    wide = df.pivot(index="date", columns="wind_code", values="volume").sort_index()
-    write_cache("mvol", key, wide)
-    return wide
-
-
-def get_minute_returns(
-    start: str | pd.Timestamp,
-    end: str | pd.Timestamp,
-    force_refresh: bool = False,
-) -> pd.DataFrame:
-    """Minute return matrix (index=datetime, columns=wind_code).
-
-    pct_change of minute close prices (/10000), used for intraday position
-    return accumulation.
-    """
-    key = cache_key("mret", str(start), str(end))
-    if not force_refresh:
-        cached = read_cache("mret", key)
-        if cached is not None:
-            return cached
-    dr = _ddb_date_range(start, end)
-    s = dc.ddb()
-    df = s.run(
-        f'''
-        select wind_code, concat(date, time) as dt, close
-        from {_MIN_TABLE}
-        where date between {dr}
-        '''
-    )
-    df["close"] = df["close"] / _PRICE_SCALE
-    df["dt"] = pd.to_datetime(df["dt"])
-    wide = df.pivot(index="dt", columns="wind_code", values="close").sort_index()
-    rets = wide.pct_change()
-    write_cache("mret", key, rets)
-    return rets
-
-
-def get_minute_price(
-    start: str | pd.Timestamp,
-    end: str | pd.Timestamp,
-    at_time: str = "10:30",
-    force_refresh: bool = False,
-) -> pd.DataFrame:
-    """Snapshot price wide table at a given time point (index=date, columns=wind_code).
-
-    Takes the close price of the minute bar at at_time (e.g. '10:30') each day,
-    used for intraday signal data cutoff. Price already /10000.
-    """
-    key = cache_key("mprice", at_time, str(start), str(end))
-    if not force_refresh:
-        cached = read_cache("mprice", key)
-        if cached is not None:
-            return cached
-    dr = _ddb_date_range(start, end)
-    s = dc.ddb()
-    df = s.run(
-        f'''
-        select wind_code, date, close
-        from {_MIN_TABLE}
-        where date between {dr} and minute(time) = {at_time}m
-        '''
-    )
-    df["close"] = df["close"] / _PRICE_SCALE
-    wide = df.pivot(index="date", columns="wind_code", values="close").sort_index()
-    write_cache("mprice", key, wide)
-    return wide
-
-
-# ───────────────────────── Index market data ─────────────────────────
-
-_INDEX_TABLE = 'loadTable("dfs://WINDDATA_MONTH", "AIndexEODPrices")'
-
-
 def get_index_close(
+    codes: list[str],
     start: str | pd.Timestamp,
     end: str | pd.Timestamp,
-    codes: list[str] | None = None,
     force_refresh: bool = False,
 ) -> pd.DataFrame:
-    """Index daily close prices (wide table: index=date, columns=index code).
+    """指数日收盘价宽表（index=date, columns=指数代码）。
 
-    Data source: DDB WINDDATA_MONTH.AIndexEODPrices (official Wind index close,
-    not adjusted). Used as benchmark for backtest comparison.
-
-    Args:
-        start/end: date range.
-        codes: list of index codes (e.g. ["000300.SH", "000905.SH", "000852.SH"]).
-            None = all indices in the table.
-        force_refresh: force refresh the cache.
-
-    Returns:
-        (T x N) wide table, index=date, columns=index code, values=close price.
+    数据源：Tushare index_daily（未复权，用作基准收益比较）。
     """
-    key = cache_key("idxclose", str(start), str(end), str(codes))
+    key = cache_key("idxclose", "|".join(codes), str(start), str(end))
     if not force_refresh:
         cached = read_cache("idxclose", key)
         if cached is not None:
             return cached
-    dr = _ddb_date_range(start, end)
-    s = dc.ddb()
-    code_filter = ""
-    if codes is not None:
-        code_list = ", ".join(f'"{c}"' for c in codes)
-        code_filter = f" and S_INFO_WINDCODE in [{code_list}]"
-    df = s.run(
-        f'''
-        select S_INFO_WINDCODE as wind_code, TRADE_DT as date, S_DQ_CLOSE as close
-        from {_INDEX_TABLE}
-        where TRADE_DT between {dr}{code_filter}
-        '''
-    )
-    wide = df.pivot(index="date", columns="wind_code", values="close").sort_index()
+
+    api = pro()
+    s, e = _ts_range(start, end)
+    parts = []
+    for code in codes:
+        _rate_limit()
+        try:
+            d = api.index_daily(ts_code=code, start_date=s, end_date=e)
+        except Exception as ex:
+            print(f"  [warn] index_daily {code} 失败: {ex}")
+            continue
+        if d is None or d.empty:
+            continue
+        d = d.copy()
+        d["trade_date"] = d["trade_date"].astype(str)
+        d["ts_code"] = d["ts_code"].astype(str)
+        parts.append(d[["ts_code", "trade_date", "close"]])
+    if not parts:
+        raise RuntimeError("index_daily 未返回任何指数收盘价；请检查 Token/积分/代码。")
+    long = pd.concat(parts, ignore_index=True)
+    wide = _long_to_wide(long, "close")
     write_cache("idxclose", key, wide)
     return wide

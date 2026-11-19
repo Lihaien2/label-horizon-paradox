@@ -7,12 +7,11 @@ Computes 158 daily features per the Microsoft Qlib default ``Alpha158`` dataset 
 
 Formulas per the Microsoft Qlib ``Alpha158`` spec (see
 https://github.com/microsoft/qlib/blob/main/qlib/contrib/data/handler.py).
-All prices are unified to the **post-adjusted** scale:
-  - OHLC uses ``S_DQ_ADJOPEN/ADJHIGH/ADJLOW/ADJCLOSE``
-  - VWAP is corrected by the adjustment factor: ``VWAP_adj = S_DQ_AVGPRICE x S_DQ_ADJFACTOR``
-  - volume uses raw ``S_DQ_VOLUME`` (Qlib semantics is raw volume)
+（【改动】价格统一到后复权口径，数据源为 Tushare：OHLC × adj_factor；VWAP =
+amount×10/vol × adj_factor；volume 用原始 vol（手），因 Alpha158 中 volume 相关
+因子均为比值/相关性，量纲不影响结果。）
 
-Supports PIT filtering by index constituents (CSI300/CSI500, etc.), no survivorship bias.
+Supports PIT filtering by index constituents (CSI300, etc.), no survivorship bias.
 
 Usage:
     from factors_calculate.alpha158_db import compute_alpha158
@@ -33,9 +32,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from data_fetch.cache import cache_key, read_cache, write_cache
-from data_fetch.calendar_db import trading_dates
-from data_fetch.marketdata_db import _fetch_eod, _to_wide
+from data_fetch.marketdata_db import get_adj_ohlcv  # 【改动】Tushare 后复权 OHLCV
 
 __all__ = ["compute_alpha158", "ALPHA158_NAMES", "ALPHA158_WINDOWS"]
 
@@ -81,60 +78,16 @@ def _fetch_ohlcv(
     codes: list[str] | None = None,
     force_refresh: bool = False,
 ) -> dict[str, pd.DataFrame]:
-    """Fetch and build 6 base wide tables (all post-adjusted).
+    """Fetch and build 6 base wide tables (all post-adjusted)——Tushare 实现。
 
     Returns:
         dict: open/high/low/close/vwap/volume, all (T x N) wide tables.
-        vwap is corrected to the post-adjusted scale by the adjustment factor.
+        vwap 已按复权因子转成后复权（见 marketdata_db.get_adj_ohlcv）。
     """
-    fields = [
-        "S_DQ_ADJOPEN", "S_DQ_ADJHIGH", "S_DQ_ADJLOW", "S_DQ_ADJCLOSE",
-        "S_DQ_AVGPRICE", "S_DQ_ADJFACTOR", "S_DQ_VOLUME",
-    ]
-    key = cache_key("alpha158_ohlcv", str(start), str(end))
-    if not force_refresh:
-        cached = read_cache("alpha158_ohlcv", key)
-        if cached is not None:
-            long_all = cached
-        else:
-            long_all = _fetch_eod(start, end, fields)
-            write_cache("alpha158_ohlcv", key, long_all)
-    else:
-        long_all = _fetch_eod(start, end, fields)
-        write_cache("alpha158_ohlcv", key, long_all)
-
-    open_ = _to_wide(long_all, "S_DQ_ADJOPEN")
-    high = _to_wide(long_all, "S_DQ_ADJHIGH")
-    low = _to_wide(long_all, "S_DQ_ADJLOW")
-    close = _to_wide(long_all, "S_DQ_ADJCLOSE")
-    avgprice = _to_wide(long_all, "S_DQ_AVGPRICE")
-    factor = _to_wide(long_all, "S_DQ_ADJFACTOR")
-    volume = _to_wide(long_all, "S_DQ_VOLUME")
-
-    # Correct VWAP to the post-adjusted scale: raw VWAP x adjustment factor
-    vwap = avgprice * factor
-
-    # Align to close's index/columns (primary axis)
-    idx = close.index
-    cols = close.columns
-    open_ = open_.reindex(index=idx, columns=cols)
-    high = high.reindex(index=idx, columns=cols)
-    low = low.reindex(index=idx, columns=cols)
-    vwap = vwap.reindex(index=idx, columns=cols)
-    volume = volume.reindex(index=idx, columns=cols)
-
-    if codes is not None:
-        codes_set = set(codes)
-        keep = [c for c in cols if c in codes_set]
-        open_ = open_[keep]
-        high = high[keep]
-        low = low[keep]
-        close = close[keep]
-        vwap = vwap[keep]
-        volume = volume[keep]
-
-    return {"open": open_, "high": high, "low": low, "close": close,
-            "vwap": vwap, "volume": volume}
+    # 【改动】直接使用 Tushare 后复权 OHLCV（内部带缓存与限速）。
+    if codes is None:
+        raise ValueError("compute_alpha158 需要提供 codes（沪深300成分股列表）。")
+    return get_adj_ohlcv(codes, start, end, force_refresh=force_refresh)
 
 
 # ───────────────────────── Rolling operators (Qlib -> pandas) ─────────────────────────
