@@ -64,8 +64,11 @@ LAM_START = 220      # λ 平均窗口 [LAM_START:LAM_END]（最后 20 步）
 LAM_END = 240
 WARMUP_EPOCHS = 3    # 2 -> 3：更好的初始表征
 WARMUP_BATCHSIZE = 4096
-WARMUP_SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # 每个 warmup seed 跑一遍完整 BLO；快速测试可改成 [0]
-N_SEED = 20          # 每个 warmup 下的 BLO 集成 seed 数；快速测试可改成 10
+
+# WARMUP_SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # 每个 warmup seed 跑一遍完整 BLO
+WARMUP_SEEDS = [0, 1, 2]   # 3 个 warmup 做稳定性验证
+
+N_SEED = 20          # 每个 warmup 下的 BLO 集成 seed 数
 BATCH_DAYS = 16      # 10 -> 16：更多交易日，IC/meta-gradient 估计更稳
 GAP_DAYS = 20        # 10 -> 20：inner/outer 拉得更开，outer 更"样本外"
 LR_INNER = 5e-3      # 1e-2 -> 5e-3：配合 INNER_STEPS=2，总位移不变但分两步

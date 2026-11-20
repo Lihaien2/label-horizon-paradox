@@ -4,11 +4,11 @@
   horizons=[1, 2, 3, 4, 5]
   基准: CSI300 sharpe=1.283 ann=20.50%
 ==========================================================================================
---- h1 [agg_topn_topn30_csi300] sharpe=1.218 ann=17.65% mdd=7.95% turnover=27.70% (耗时 10s)
---- h2 [agg_topn_topn30_csi300] sharpe=0.918 ann=13.61% mdd=7.87% turnover=24.67% (耗时 8s)
---- h3 [agg_topn_topn30_csi300] sharpe=0.830 ann=12.38% mdd=8.66% turnover=24.76% (耗时 8s)
+--- h1 [agg_topn_topn30_csi300] sharpe=1.218 ann=17.65% mdd=7.95% turnover=27.70% (耗时 6s)
+--- h2 [agg_topn_topn30_csi300] sharpe=0.918 ann=13.61% mdd=7.87% turnover=24.67% (耗时 6s)
+--- h3 [agg_topn_topn30_csi300] sharpe=0.830 ann=12.38% mdd=8.66% turnover=24.76% (耗时 6s)
 --- h4 [agg_topn_topn30_csi300] sharpe=0.921 ann=14.55% mdd=8.57% turnover=24.59% (耗时 6s)
---- h5 [agg_topn_topn30_csi300] sharpe=0.699 ann=11.01% mdd=11.74% turnover=23.54% (耗时 7s)
+--- h5 [agg_topn_topn30_csi300] sharpe=0.699 ann=11.01% mdd=11.74% turnover=23.54% (耗时 6s)
 
 ==========================================================================================
 Summary: mode=agg pool=topn（沪深300，TopN=30）
@@ -25,6 +25,6 @@ Summary: mode=agg pool=topn（沪深300，TopN=30）
 
 NAV 保存至: backtest_agg_topn_topn30_csi300_h{h}.csv
 汇总保存至: backtest_agg_topn_summary.csv
-总耗时 40s
+总耗时 29s
 
 *** Done ***
