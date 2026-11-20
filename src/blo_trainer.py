@@ -132,8 +132,7 @@ class BLOTrainer:
         in ``build_tensors`` and shared across batches. Uses 4096-sample random
         batches with SGD + momentum (same as the brute-force search).
         """
-        opt = torch.optim.SGD(self.student.parameters(), lr=self.lr_inner,
-                              momentum=0.95, weight_decay=1e-4)
+        opt = torch.optim.Adam(self.student.parameters(), lr=1e-3, weight_decay=1e-4)
         n = X.shape[0]
         for _ in range(n_epochs):
             self.student.train()
@@ -250,6 +249,7 @@ class BLOTrainer:
             entropy = -(lam2 * torch.log(lam2 + 1e-8)).sum()
             outer_loss = outer_ic_loss - self.entropy_weight * entropy
             outer_loss.backward()  # gradient to teacher.logits.grad
+            torch.nn.utils.clip_grad_norm_(self.student.parameters(), 1.0)
             last_outer_loss = outer_loss.item()
 
             # ---- update lambda ----

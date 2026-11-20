@@ -23,6 +23,8 @@ R_AGG：由 run_search.py 产出的聚合 alpha 的测试 IC **自动重算**（
 """
 from __future__ import annotations
 
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import sys
 import warnings
 import contextlib
@@ -42,6 +44,7 @@ for _p in (_HERE, _ROOT):
 import numpy as np
 import pandas as pd
 import torch
+torch.backends.cudnn.enabled = False   # ← 加这一行
 
 from src.config import (
     DEVICE, HORIZONS, RESULTS_DIR, TARGET_H, LOOKBACK,
@@ -63,7 +66,7 @@ WARMUP_SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # 每个 warmup seed 跑一遍完
 N_SEED = 20          # 每个 warmup 下的 BLO 集成 seed 数
 BATCH_DAYS = 10      # inner/outer 各采样的天数
 GAP_DAYS = 10        # inner 与 outer 日期区间之间的最小间隔（保留 10 依旧安全）
-LR_INNER = 0.05
+LR_INNER = 1e-2      # inner-loop 可微 SGD 步长，LSTM 用 0.05 太大；先试 1e-2，不稳再降 1e-3
 LR_OUTER = 0.1
 INNER_MOMENTUM = 0.9
 INNER_STEPS = 1

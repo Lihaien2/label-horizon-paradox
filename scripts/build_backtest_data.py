@@ -70,7 +70,15 @@ def build(start: str, end: str, out_dir: Path, force: bool):
     limit_up, limit_down = md.get_limit_status(codes, start, end, force_refresh=force)
     _save("limit_up", limit_up, out_dir, force)
     _save("limit_down", limit_down, out_dir, force)
-    tradable = md.get_tradable_mask(codes, start, end, force_refresh=force)
+    # ---------------- 修改开始 ----------------
+    # 原来的代码（注释掉）：
+    # tradable = md.get_tradable_mask(codes, start, end, force_refresh=force)
+
+    # 新代码：直接从日线收盘价推导可交易状态,避开 Tushare 限流
+    # 如果收盘价是 NaN，说明当天停牌（或者还没上市/已退市）
+    adjclose_df = ohlcv["close"]
+    tradable = adjclose_df.notna()
+    # ---------------- 修改结束 ----------------
     _save("tradable_mask", tradable, out_dir, force)
 
     print(f"\n[4] 指数成分掩码 / 指数收盘...", flush=True)

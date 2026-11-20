@@ -23,6 +23,8 @@
   python scripts/run_backtest.py --mode seed --topn 30 --h 5       # seed 模式单 h
 """
 from __future__ import annotations
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import sys, warnings, time, argparse
 from pathlib import Path
 

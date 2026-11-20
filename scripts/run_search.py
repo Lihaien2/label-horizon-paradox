@@ -22,7 +22,8 @@
   - log_search.txt
 """
 from __future__ import annotations
-
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import sys
 import warnings
 import time
@@ -62,7 +63,7 @@ WEIGHT_DECAY = 1e-4
 EPOCHS = 15
 BATCH_SIZE = 4096
 MOMENTUM = 0.95
-LR = 0.05
+LR = 1e-3
 # LSTM 结构超参（【改动】新增）。
 LSTM_HIDDEN = 64
 LSTM_LAYERS = 1
@@ -84,7 +85,7 @@ def train_horizon(Xt, yt, dtr, Xv, yv, dv, Xte, yte, dte, in_dim, seed,
     torch.manual_seed(seed)
     np.random.seed(seed)
     model = AlphaLSTM(in_dim, hidden_size=hidden, num_layers=layers, dropout=dropout).to(DEVICE)
-    opt = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
+    opt = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     n = len(Xt)
     best = -np.inf
     best_state = None
@@ -106,6 +107,7 @@ def train_horizon(Xt, yt, dtr, Xv, yv, dv, Xte, yte, dte, in_dim, seed,
             loss = nn.functional.mse_loss(pred, yb)
             opt.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             train_sum += float(loss.item()) * len(idx)
             nb += len(idx)

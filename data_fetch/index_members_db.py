@@ -32,18 +32,32 @@ _CSI300_ALT = "399300.SZ"
 
 
 def _fetch_snapshots(index_code: str, start: str, end: str) -> pd.DataFrame:
-    """拉取指数月度成分快照（长表）。
-
-    返回 DataFrame[con_code, trade_date, weight]，trade_date 为 'YYYYMMDD' 字符串。
-    """
+    """按月循环拉取指数月度成分快照（避免 index_weight 单次大范围被截断）。"""
     api = pro()
-    df = api.index_weight(index_code=index_code, start_date=start, end_date=end)
-    if df is None or df.empty:
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    month_starts = pd.date_range(start_ts.replace(day=1), end_ts.replace(day=1), freq="MS")
+    parts = []
+    for ms in month_starts:
+        me = ms + pd.offsets.MonthEnd(0)
+        lo = max(ms, start_ts).strftime("%Y%m%d")
+        hi = min(me, end_ts).strftime("%Y%m%d")
+        time.sleep(0.12)  # 限速（index_members_db 顶部已 import time）
+        try:
+            d = api.index_weight(index_code=index_code, start_date=lo, end_date=hi)
+        except Exception as ex:
+            print(f"  [warn] index_weight {index_code} {lo}-{hi} 失败: {ex}")
+            continue
+        if d is None or d.empty:
+            continue
+        d = d[d["con_code"].notna()].copy()
+        d["con_code"] = d["con_code"].astype(str)
+        d["trade_date"] = d["trade_date"].astype(str).str.replace("-", "", regex=False)
+        parts.append(d[["con_code", "trade_date", "weight"]])
+    if not parts:
         return pd.DataFrame()
-    df = df[df["con_code"].notna()].copy()
-    df["con_code"] = df["con_code"].astype(str)
-    df["trade_date"] = df["trade_date"].astype(str).str.replace("-", "", regex=False)
-    return df[["con_code", "trade_date", "weight"]]
+    out = pd.concat(parts, ignore_index=True)
+    out = out.drop_duplicates(subset=["con_code", "trade_date"])
+    return out
 
 
 def _snapshots_with_fallback(index_code: str, start: str, end: str) -> tuple[pd.DataFrame, str]:
