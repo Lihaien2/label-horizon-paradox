@@ -11,8 +11,8 @@ data/**
 !data/**/.gitkeep
 
 # Results — ignore all outputs, keep .gitkeep skeletons
-results/**
-!results/**/
+#results/**
+#!results/**/
 !results/**/.gitkeep
 
 # Data-fetch cache

@@ -1,0 +1,113 @@
+====================================================================================================
+BLO | LSTM 回看10天 | 缓存因子(69 tanh + 89 keep) | 标签截尾0.5%+z+clip3 | 20seed
+  随机分散采样(batch=10, gap=10) | warmup2ep(bs=4096, diff-z) 180iters | λ avg [160:180]
+  M=1 lr_inner=0.01 lr_outer=0.1 momentum=0.9 | LSTM hidden=64 layers=1
+  train 2020-01-02~2023-12-31 valid 2024-01-02~2024-12-31 test 2025-01-02~2026-06-30
+====================================================================================================
+  标签分位数阈值(train q0.5/q99.5): h1=[-0.073,0.087] h2=[-0.107,0.138] h3=[-0.129,0.176] h4=[-0.147,0.206] h5=[-0.160,0.234]
+  数据加载+张量构建：train=(284870, 10, 158) valid=(70498, 10, 158) test=(103763, 10, 158) (40s)
+  搜索 IC: h1=0.0157 h2=0.0041 h3=0.0057 h4=0.0089 h5=0.0035
+  R_AGG（IC 排名，5=最好）= [5.0, 2.0, 3.0, 4.0, 1.0]
+
+[warmup 2ep seed=0] 共享 student (diff-z)...
+  warmup0 done (2s)
+    [warmup0] seed0/20 rc=-0.300 argmax=h3 (累计 18s)
+    [warmup0] seed5/20 rc=0.700 argmax=h1 (累计 97s)
+    [warmup0] seed10/20 rc=-0.100 argmax=h3 (累计 176s)
+    [warmup0] seed15/20 rc=-0.100 argmax=h5 (累计 255s)
+    [warmup0] seed19/20 rc=-0.900 argmax=h5 (累计 319s)
+  [warmup0] ens_rc=-0.300 rc_mean=-0.090 argmax=h5 正seed=9/20 (319s)
+
+[warmup 2ep seed=1] 共享 student (diff-z)...
+  warmup1 done (319s)
+    [warmup1] seed0/20 rc=-0.500 argmax=h5 (累计 335s)
+    [warmup1] seed5/20 rc=-0.300 argmax=h5 (累计 414s)
+    [warmup1] seed10/20 rc=-0.400 argmax=h2 (累计 494s)
+    [warmup1] seed15/20 rc=0.400 argmax=h1 (累计 576s)
+    [warmup1] seed19/20 rc=-0.900 argmax=h2 (累计 641s)
+  [warmup1] ens_rc=-0.600 rc_mean=-0.115 argmax=h5 正seed=7/20 (641s)
+
+[warmup 2ep seed=2] 共享 student (diff-z)...
+  warmup2 done (641s)
+    [warmup2] seed0/20 rc=-0.800 argmax=h5 (累计 657s)
+    [warmup2] seed5/20 rc=0.000 argmax=h4 (累计 739s)
+    [warmup2] seed10/20 rc=-0.100 argmax=h3 (累计 819s)
+    [warmup2] seed15/20 rc=0.400 argmax=h1 (累计 901s)
+    [warmup2] seed19/20 rc=-0.700 argmax=h5 (累计 966s)
+  [warmup2] ens_rc=-0.500 rc_mean=-0.210 argmax=h3 正seed=5/20 (966s)
+
+[warmup 2ep seed=3] 共享 student (diff-z)...
+  warmup3 done (966s)
+    [warmup3] seed0/20 rc=-0.500 argmax=h5 (累计 983s)
+    [warmup3] seed5/20 rc=-0.600 argmax=h5 (累计 1064s)
+    [warmup3] seed10/20 rc=-0.100 argmax=h3 (累计 1145s)
+    [warmup3] seed15/20 rc=0.400 argmax=h1 (累计 1224s)
+    [warmup3] seed19/20 rc=-0.600 argmax=h3 (累计 1288s)
+  [warmup3] ens_rc=-0.300 rc_mean=-0.175 argmax=h5 正seed=7/20 (1288s)
+
+[warmup 2ep seed=4] 共享 student (diff-z)...
+  warmup4 done (1289s)
+    [warmup4] seed0/20 rc=-0.800 argmax=h5 (累计 1304s)
+    [warmup4] seed5/20 rc=0.200 argmax=h4 (累计 1384s)
+    [warmup4] seed10/20 rc=-0.300 argmax=h3 (累计 1463s)
+    [warmup4] seed15/20 rc=0.400 argmax=h1 (累计 1542s)
+    [warmup4] seed19/20 rc=-0.700 argmax=h2 (累计 1606s)
+  [warmup4] ens_rc=-0.300 rc_mean=-0.085 argmax=h5 正seed=8/20 (1606s)
+
+[warmup 2ep seed=5] 共享 student (diff-z)...
+  warmup5 done (1607s)
+    [warmup5] seed0/20 rc=-0.600 argmax=h3 (累计 1622s)
+    [warmup5] seed5/20 rc=0.000 argmax=h4 (累计 1702s)
+    [warmup5] seed10/20 rc=-0.300 argmax=h3 (累计 1782s)
+    [warmup5] seed15/20 rc=0.000 argmax=h5 (累计 1862s)
+    [warmup5] seed19/20 rc=-0.700 argmax=h2 (累计 1926s)
+  [warmup5] ens_rc=0.000 rc_mean=-0.115 argmax=h4 正seed=6/20 (1926s)
+
+[warmup 2ep seed=6] 共享 student (diff-z)...
+  warmup6 done (1927s)
+    [warmup6] seed0/20 rc=-0.500 argmax=h5 (累计 1942s)
+    [warmup6] seed5/20 rc=-0.300 argmax=h5 (累计 2022s)
+    [warmup6] seed10/20 rc=-0.300 argmax=h2 (累计 2102s)
+    [warmup6] seed15/20 rc=-0.100 argmax=h5 (累计 2183s)
+    [warmup6] seed19/20 rc=-0.700 argmax=h2 (累计 2248s)
+  [warmup6] ens_rc=-0.600 rc_mean=-0.145 argmax=h5 正seed=5/20 (2248s)
+
+[warmup 2ep seed=7] 共享 student (diff-z)...
+  warmup7 done (2249s)
+    [warmup7] seed0/20 rc=0.200 argmax=h3 (累计 2265s)
+    [warmup7] seed5/20 rc=0.000 argmax=h4 (累计 2344s)
+    [warmup7] seed10/20 rc=-0.300 argmax=h4 (累计 2421s)
+    [warmup7] seed15/20 rc=0.100 argmax=h1 (累计 2497s)
+    [warmup7] seed19/20 rc=-0.900 argmax=h5 (累计 2558s)
+  [warmup7] ens_rc=0.000 rc_mean=-0.065 argmax=h4 正seed=10/20 (2558s)
+
+[warmup 2ep seed=8] 共享 student (diff-z)...
+  warmup8 done (2558s)
+    [warmup8] seed0/20 rc=-0.800 argmax=h5 (累计 2574s)
+    [warmup8] seed5/20 rc=-0.100 argmax=h5 (累计 2653s)
+    [warmup8] seed10/20 rc=-0.100 argmax=h4 (累计 2732s)
+    [warmup8] seed15/20 rc=-0.100 argmax=h5 (累计 2810s)
+    [warmup8] seed19/20 rc=-0.900 argmax=h2 (累计 2874s)
+  [warmup8] ens_rc=-0.300 rc_mean=-0.180 argmax=h5 正seed=6/20 (2874s)
+
+[warmup 2ep seed=9] 共享 student (diff-z)...
+  warmup9 done (2874s)
+    [warmup9] seed0/20 rc=-0.500 argmax=h5 (累计 2890s)
+    [warmup9] seed5/20 rc=-0.100 argmax=h5 (累计 2969s)
+    [warmup9] seed10/20 rc=0.100 argmax=h2 (累计 3048s)
+    [warmup9] seed15/20 rc=0.600 argmax=h1 (累计 3127s)
+    [warmup9] seed19/20 rc=-0.300 argmax=h3 (累计 3189s)
+  [warmup9] ens_rc=0.000 rc_mean=-0.065 argmax=h4 正seed=9/20 (3189s)
+
+=== Results (10 warmup seed(s)) ===
+  per-warmup ens_rc: [-0.3, -0.6, -0.5, -0.3, -0.3, 0.0, -0.6, 0.0, -0.3, 0.0]
+  per-warmup argmax: [5, 5, 3, 5, 5, 4, 5, 4, 5, 4]
+  grand ens_rc (all warmup) = -0.300
+  grand argmax = h5
+  grand lambda = [0.1443, 0.1391, 0.223, 0.2441, 0.2495]
+  elapsed = 3189s
+  results saved: D:\lhe\Label Horizon Paradox\label-horizon-paradox\results\blo\blo_results.csv
+  loss saved: D:\lhe\Label Horizon Paradox\label-horizon-paradox\results\blo\blo_loss_agg.csv
+  per-warmup results in: D:\lhe\Label Horizon Paradox\label-horizon-paradox\results\blo/blo_warmup*.csv
+
+*** All done ***
