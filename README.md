@@ -144,7 +144,7 @@ python scripts/run_plot.py
 > - **IC ranking**: `results/losses/search_ic_ranking.csv` (and `results/figures/ic_ranking.png`)
 > - **BLO λ / rc**: `results/blo/blo_results.csv` (and `results/figures/lambda_distribution.png`)
 > - **Backtest**: `results/backtest/backtest_agg_topn_summary.csv` (and `results/figures/backtest_nav.png`)
-> - **Loss curves (BLO vs no-BLO, train+test)**: `results/figures/loss_curve_blo_vs_noblo.png`
+> - **Loss curves (BLO vs no-BLO, train+valid)**: `results/figures/loss_curve_blo_vs_noblo.png`
 > - **Everything summarized**: `results/figures/summary.md`
 
 The key result to look for is the **Label Horizon Paradox**: in the brute-force

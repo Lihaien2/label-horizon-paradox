@@ -266,9 +266,12 @@ class BLOTrainer:
                 if val_X is not None:
                     pred_v = self.student(val_X)  # student reflects inner updates
                     val_ic = daily_ic(pred_v, val_Y_target, val_date_ids).item()
+                    # 【改动】损失曲线改用"验证集"：复用 pred_v 直接算验证集 MSE，零额外开销。
+                    valid_loss = nn.functional.mse_loss(pred_v, val_Y_target).item()
                 else:
                     val_ic = float('nan')
-                # 【改动】损失曲线：train/test 用目标 horizon 标签的 MSE（固定子样本，省时）。
+                    valid_loss = float('nan')
+                # 损失曲线：train/test 用目标 horizon 标签的 MSE（固定子样本，省时）。
                 if train_eval_X is not None:
                     train_loss = nn.functional.mse_loss(
                         self.student(train_eval_X), train_eval_Y).item()
@@ -282,8 +285,8 @@ class BLOTrainer:
                     test_loss = test_ic = float('nan')
             history.append({"iter": it, "lambda": lam_val,
                             "outer_loss": last_outer_loss, "val_ic": val_ic,
-                            "train_loss": train_loss, "test_loss": test_loss,
-                            "test_ic": test_ic})
+                            "train_loss": train_loss, "valid_loss": valid_loss,
+                            "test_loss": test_loss, "test_ic": test_ic})
             if it % max(1, n_iters // 10) == 0 or it == n_iters - 1:
                 print(f"  [iter {it}/{n_iters}] outer_loss={last_outer_loss:.4f} "
                       f"val_ic={val_ic:.4f} lambda={lam_val.round(3)}", flush=True)

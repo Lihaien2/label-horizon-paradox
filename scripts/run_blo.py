@@ -56,21 +56,23 @@ from src.data_utils import (
     get_universe_mask, prepare_factor_series, _window_slice, metrics_for_alpha,
 )
 
-# ---- BLO 超参数 ----
-N_ITERS = 180        # 每个 seed 的 BLO 更新步数（每次一个样本）
-LAM_START = 160      # λ 平均窗口 [LAM_START:LAM_END]（最后 20 步）
-LAM_END = 180
-WARMUP_EPOCHS = 2    # warmup epoch（SGD + diff-z，共享 student）
+# ---- BLO 超参数（为"弱信号下不复现悖论"做了一轮针对性调整）----
+# 诊断：M=1 的 meta-gradient 偏向"和目标最像的标签"(h5)，writeback 正反馈强化，
+# 加上弱信号高噪声，λ 会系统性滑向 h5。下面几项分别针对"短视 / 噪声 / 塌缩"。
+N_ITERS = 240        # 180 -> 240：更多步平均 λ 噪声
+LAM_START = 220      # λ 平均窗口 [LAM_START:LAM_END]（最后 20 步）
+LAM_END = 240
+WARMUP_EPOCHS = 3    # 2 -> 3：更好的初始表征
 WARMUP_BATCHSIZE = 4096
-WARMUP_SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # 每个 warmup seed 跑一遍完整 BLO
-N_SEED = 20          # 每个 warmup 下的 BLO 集成 seed 数
-BATCH_DAYS = 10      # inner/outer 各采样的天数
-GAP_DAYS = 10        # inner 与 outer 日期区间之间的最小间隔（保留 10 依旧安全）
-LR_INNER = 1e-2      # inner-loop 可微 SGD 步长，LSTM 用 0.05 太大；先试 1e-2，不稳再降 1e-3
+WARMUP_SEEDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]  # 每个 warmup seed 跑一遍完整 BLO；快速测试可改成 [0]
+N_SEED = 20          # 每个 warmup 下的 BLO 集成 seed 数；快速测试可改成 10
+BATCH_DAYS = 16      # 10 -> 16：更多交易日，IC/meta-gradient 估计更稳
+GAP_DAYS = 20        # 10 -> 20：inner/outer 拉得更开，outer 更"样本外"
+LR_INNER = 5e-3      # 1e-2 -> 5e-3：配合 INNER_STEPS=2，总位移不变但分两步
 LR_OUTER = 0.1
 INNER_MOMENTUM = 0.9
-INNER_STEPS = 1
-ENTROPY_WEIGHT = 1e-4
+INNER_STEPS = 2      # 1 -> 2：让 inner 真正走两步，outer 更像"训练后泛化"（治短视）
+ENTROPY_WEIGHT = 5e-4  # 1e-4 -> 5e-4：更强的熵正则，防止 λ 塌缩到 h5
 # LSTM 结构超参（与 run_search 保持一致）。
 LSTM_HIDDEN = 64
 LSTM_LAYERS = 1
@@ -323,6 +325,7 @@ def main():
                     "warmup_seed": ws, "blo_seed": bs,
                     "iter": hrec["iter"], "outer_loss": hrec["outer_loss"],
                     "val_ic": hrec["val_ic"], "train_loss": hrec["train_loss"],
+                    "valid_loss": hrec.get("valid_loss", float("nan")),  # 【改动】新增验证集损失
                     "test_loss": hrec["test_loss"], "test_ic": hrec["test_ic"],
                 })
             del t

@@ -54,40 +54,51 @@ def _fig(title, xlabel, ylabel):
 
 
 def plot_loss_curves_blo_vs_noblo(search_loss_path=None, blo_loss_path=None, out_path=None):
-    """【核心图】有 BLO vs 无 BLO 在训练集/测试集的四条损失曲线（一张图对比）。
+    """【核心图】有 BLO vs 无 BLO 在**训练集/验证集**的四条损失曲线（一张图对比）。
 
-    无 BLO 取 h=TARGET_H 的搜索模型：跨 seed 对每个 epoch 的 train/test MSE 取均值。
-    有 BLO 取跨 seed/warmup 对每个 iter 的 train/test MSE 取均值。
+    （按用户要求：loss 曲线看的是 train 与 valid，不再用 test。）
+    无 BLO 取 h=TARGET_H 的搜索模型：跨 seed 对每个 epoch 的 train/valid MSE 取均值。
+    有 BLO 取跨 seed/warmup 对每个 iter 的 train/valid MSE 取均值。
+    若旧版 blo_loss_agg.csv 没有 valid_loss 列，会回退到 test_loss 并给出提示。
     """
     search_loss_path = Path(search_loss_path) if search_loss_path else LOSSES_DIR / "search_loss_agg.csv"
     blo_loss_path = Path(blo_loss_path) if blo_loss_path else RESULTS_DIR / "blo" / "blo_loss_agg.csv"
     out_path = Path(out_path) if out_path else FIGURES_DIR / "loss_curve_blo_vs_noblo.png"
 
-    fig, ax = _fig("Training/Test Loss: No-BLO (h=5) vs BLO (LSTM)",
+    fig, ax = _fig("Training/Validation Loss: No-BLO (h=5) vs BLO (LSTM)",
                    "training progress (epoch for No-BLO / iter for BLO)", "MSE loss")
 
     plotted_any = False
 
-    # ---- 无 BLO：搜索 h=5 的损失（按 epoch 对 seed 取均值）----
+    # ---- 无 BLO：搜索 h=5 的损失（按 epoch 对 seed 取均值，train + valid）----
     if search_loss_path.exists():
         df = pd.read_csv(search_loss_path)
         sub = df[df["h"] == TARGET_H]
         if not sub.empty:
-            g = sub.groupby("epoch")[["train_loss", "test_loss"]].mean().reset_index()
+            g = sub.groupby("epoch")[["train_loss", "valid_loss"]].mean().reset_index()
             ax.plot(g["epoch"], g["train_loss"], label="No-BLO train", color="tab:blue", marker="o", lw=2)
-            ax.plot(g["epoch"], g["test_loss"], label="No-BLO test", color="tab:red", marker="o", lw=2)
+            ax.plot(g["epoch"], g["valid_loss"], label="No-BLO valid", color="tab:red", marker="o", lw=2)
             plotted_any = True
     else:
         print(f"  [plot] 未找到 {search_loss_path}（先运行 run_search.py）")
 
-    # ---- 有 BLO：按 iter 对 seed/warmup 取均值 ----
+    # ---- 有 BLO：按 iter 对 seed/warmup 取均值（train + valid）----
     if blo_loss_path.exists():
         df = pd.read_csv(blo_loss_path)
         if not df.empty:
-            g = df.groupby("iter")[["train_loss", "test_loss"]].mean().reset_index()
-            ax.plot(g["iter"], g["train_loss"], label="BLO train", color="tab:cyan", linestyle="--", lw=2)
-            ax.plot(g["iter"], g["test_loss"], label="BLO test", color="tab:orange", linestyle="--", lw=2)
-            plotted_any = True
+            if "valid_loss" in df.columns and df["valid_loss"].notna().any():
+                g = df.groupby("iter")[["train_loss", "valid_loss"]].mean().reset_index()
+                ax.plot(g["iter"], g["train_loss"], label="BLO train", color="tab:cyan", linestyle="--", lw=2)
+                ax.plot(g["iter"], g["valid_loss"], label="BLO valid", color="tab:orange", linestyle="--", lw=2)
+                plotted_any = True
+            else:
+                # 兼容旧文件：没有 valid_loss 时退回 test_loss，并明确提示需要重跑 run_blo。
+                print("  [plot] 警告：blo_loss_agg.csv 缺少 valid_loss 列（旧版），"
+                      "暂用 test_loss 代替；请重跑 run_blo.py 以得到验证集曲线。")
+                g = df.groupby("iter")[["train_loss", "test_loss"]].mean().reset_index()
+                ax.plot(g["iter"], g["train_loss"], label="BLO train", color="tab:cyan", linestyle="--", lw=2)
+                ax.plot(g["iter"], g["test_loss"], label="BLO test (legacy)", color="tab:orange", linestyle="--", lw=2)
+                plotted_any = True
     else:
         print(f"  [plot] 未找到 {blo_loss_path}（先运行 run_blo.py）")
 
